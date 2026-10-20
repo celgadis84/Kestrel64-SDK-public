@@ -1,5 +1,10 @@
 # tiny3d A/B: libdragon vs kestrel64-sdk
 
+> The compat layer used for side B (`compat/`) is not part of the public release yet, so
+> side B cannot be rebuilt from this repository. All figures come from the kestrel64
+> emulator, whose RSP/RDP timing is not calibrated against hardware: read them as
+> indicative.
+
 Same tiny3d example sources, built twice:
 
 - **A**: tiny3d on libdragon (preview branch, commit 43c67dc), official prebuilt

@@ -4,6 +4,10 @@ Bare-metal Nintendo 64 SDK built around its own RSP microcode (**kgfx**) and a d
 command stream. C on the CPU, hand-written RSP vector code, host tools in Python; builds
 with clang + CMake/Ninja and runs on hardware and on the kestrel64 emulator.
 
+Development happens in a private repository. This public repository receives the parts
+considered mature enough to release, as squashed snapshots, so its history is a list of
+releases, not of the work.
+
 ## Demos
 
 | ROM | Shows |
@@ -59,6 +63,12 @@ ROMs land in `build/demos/<name>/<name>.z64`. Docs: [docs/KGFX.md](docs/KGFX.md)
   LibSaturn project's dino_demo. Converted (decimated, texture atlas, quantized animation) by
   kestrel64-sdk; see [assets/trex/LICENSE.txt](assets/trex/LICENSE.txt). The credit is also
   shown on screen in the demo.
+- **[libdragon](https://github.com/DragonMinded/libdragon)** (Unlicense): much of the RDP side
+  follows its design: rdpq's sync handling and render-mode/combiner setup, `rdpq_font` as the
+  model for `gfx/font`, the VI timing values (`src/hal/vi.c`), and the triangle setup method
+  of kgfx, taken from `rsp_rdpq_tri.inc` by Giovanni Bajo (`src/rsp/kgfx.S`).
+- **[tiny3d](https://github.com/HailToDodongo/tiny3d)** by HailToDodongo: reference for the 3D
+  pipeline, the packed 5.6.5 normal encoding, and the scenes used in the A/B comparisons.
 - IPL3: libdragon's open-source IPL3, see [third_party/ipl3](third_party/ipl3/LICENSE-libdragon.md).
 
 ## License

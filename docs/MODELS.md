@@ -180,6 +180,8 @@ runs. **Done** (2026-10-04): PARTICLES command, Y billboards and impostors, see 
 
 ## 4. tiny3d compatibility layer
 
+> Not part of the public release yet (`compat/` lives in the development repository).
+
 **Done** for `00_quad`, `01_model`, `03_objects` (unmodified sources, `compat/`). Results,
 patches and method: [TINY3D-AB.md](TINY3D-AB.md). Both sides hold 60 fps at default load;
 with 250 actors libdragon is RSP-bound at 50 ms/frame, the compat CPU-bound at 74 ms.
