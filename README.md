@@ -63,10 +63,10 @@ ROMs land in `build/demos/<name>/<name>.z64`. Docs: [docs/KGFX.md](docs/KGFX.md)
   LibSaturn project's dino_demo. Converted (decimated, texture atlas, quantized animation) by
   kestrel64-sdk; see [assets/trex/LICENSE.txt](assets/trex/LICENSE.txt). The credit is also
   shown on screen in the demo.
-- **[libdragon](https://github.com/DragonMinded/libdragon)** (Unlicense): much of the RDP side
-  follows its design: rdpq's sync handling and render-mode/combiner setup, `rdpq_font` as the
-  model for `gfx/font`, the VI timing values (`src/hal/vi.c`), and the triangle setup method
-  of kgfx, taken from `rsp_rdpq_tri.inc` by Giovanni Bajo (`src/rsp/kgfx.S`).
+- **[libdragon](https://github.com/DragonMinded/libdragon)** (Unlicense): the kgfx triangle
+  setup method comes from `rsp_rdpq_tri.inc` by Giovanni Bajo (`src/rsp/kgfx.S`) and the VI
+  timing values from its `vi.c` (`src/hal/vi.c`). Its rdpq and the n64brew docs were a
+  reference for RDP sync rules and render modes.
 - **[tiny3d](https://github.com/HailToDodongo/tiny3d)** by HailToDodongo: reference for the 3D
   pipeline, the packed 5.6.5 normal encoding, and the scenes used in the A/B comparisons.
 - IPL3: libdragon's open-source IPL3, see [third_party/ipl3](third_party/ipl3/LICENSE-libdragon.md).
