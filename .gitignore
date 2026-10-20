@@ -1,0 +1,4 @@
+build*/
+*.z64
+__pycache__/
+!third_party/ipl3/ipl3_compat.z64

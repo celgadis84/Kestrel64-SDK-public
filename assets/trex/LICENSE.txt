@@ -1,0 +1,21 @@
+"Tyrannosaurus Rex Lowpoly" by pikabobalex
+Source: https://sketchfab.com/3d-models/tyrannosaurus-rex-lowpoly-516dbe9717554e74b0bfcbb77a431b17
+Short source link: https://skfb.ly/6swQF
+
+Licensed under Creative Commons Attribution 4.0 International (CC BY 4.0):
+https://creativecommons.org/licenses/by/4.0/
+
+trex_walking_seamless.glb is the original GLB, unmodified, as redistributed by
+the LibSaturn project (dino_demo example). SHA-256:
+207694403B987B6A465107524754D8E0D100174C85B214825E74BEFF492484D1
+
+kestrel64-sdk redistributes it under that license. At build time
+tools/k64bake.py (tools/k64model.py) derives the N64 model blob from it
+(demo 10_trex): the mesh is decimated (10902 -> 2400 triangles), its textures
+are packed into one 64x64 4-bit indexed atlas, the skin weights are reduced to
+two joints in quarter steps and the animation is resampled at 30 fps and
+quantized. These changes were made by kestrel64-sdk; pikabobalex did not create
+or endorse the conversion or the demo.
+
+The attribution and license apply to the artwork and the derived model data.
+The SDK source code is not covered by CC BY 4.0.
