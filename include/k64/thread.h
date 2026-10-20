@@ -57,6 +57,7 @@ s32  k64_thread_get_pri(k64_thread_t *t);             // NULL = self
 k64_thread_t *k64_thread_self(void);
 void k64_thread_yield(void);                          // behind the other ready threads of its priority
 
+// FIFO of `count` messages stored in `msgs` (owned by the caller, must outlive the queue).
 void k64_mq_init(k64_mq_t *q, k64_msg_t *msgs, u32 count);
 // Block = wait for room / a message; otherwise return false at once.
 bool k64_mq_send(k64_mq_t *q, k64_msg_t m, bool block);

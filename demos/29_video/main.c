@@ -11,7 +11,14 @@
 extern const u8 clip[];
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[29_video] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                             \
+  do {                                            \
+    if (!(c)) {                                   \
+      fails++;                                    \
+      k64_printf("[29_video] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                           \
+    }                                             \
+  } while (0)
 
 int main(void) {
   k64_display_init(&(k64_display_cfg_t){ .width = 320, .height = 240, .bpp = K64_BPP16, .buffers = 2 });

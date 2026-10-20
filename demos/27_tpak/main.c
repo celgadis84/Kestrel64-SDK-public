@@ -5,7 +5,14 @@
 #include <k64/k64.h>
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[27_tpak] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                            \
+  do {                                           \
+    if (!(c)) {                                  \
+      fails++;                                   \
+      k64_printf("[27_tpak] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                          \
+    }                                            \
+  } while (0)
 
 static u8 rom_byte(u32 i) { return (u8)(i * 31 ^ (i >> 14) * 0x5B ^ (i >> 8)); }
 

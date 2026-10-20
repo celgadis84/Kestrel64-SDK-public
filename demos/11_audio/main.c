@@ -13,7 +13,7 @@
 #define SAW_N   100
 #define DRUM_N  3000
 #define ADPCM_RECS 40                      // per ADPCM voice: <= 10 groups, <= 3 parts (organ loop 240)
-#define MAXREC  (K64_MIXER_VOICES * ((FRAMES + 127) / 128) * 2 + (FRAMES + 127) / 128 + 1 +                  2 * ADPCM_RECS + 1)
+#define MAXREC     (K64_MIXER_VOICES * ((FRAMES + 127) / 128) * 2 + (FRAMES + 127) / 128 + 1 + 2 * ADPCM_RECS + 1)
 
 static s16 sine[SINE_N + 1] K64_ALIGN(16);
 static s16 sqr[SQR_N + 1] K64_ALIGN(16);

@@ -8,6 +8,8 @@
 #pragma once
 #include "hw.h"
 
+// Runs the program `in` and copies the PIF RAM after it to `out` (in may equal out). Collects
+// a pending k64_pad_poll_start first.
 void k64_joybus_exec(const u8 in[64], u8 out[64]);
 
 // One command on one channel: tx bytes in, rx bytes out. Returns false if the device did

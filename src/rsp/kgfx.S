@@ -181,6 +181,12 @@ DATA_END:
     .def dlen   $t9             // dma_read: length - 1
     .def outptr $s3             // OUTBUF write pointer (RDP commands not yet sent)
     .def ntri   $v0             // triangles emitted (stored to TRICOUNT at END)
+    .def mtxdirty $at           // != 0: MTX was reloaded, VTX must load the matrix registers
+    .def dmastat $t0            // SP_DMA_FULL / SP_DMA_BUSY polls
+    .def opofs  $t0             // dispatch: opcode * 2 - 0x20, then the handler address
+    .def handler $t2
+    // Unless a routine's header says otherwise, $t0-$t8 are scratch and $v13 is the only
+    // vector scratch outside VTX.
 
 // ---- code ------------------------------------------------------------------------------------
     .text
@@ -191,7 +197,7 @@ START:
     jal     load_viewport
     nop
     jal     load_matrix
-    li      $at, 0                      // matrix registers match MTX
+    li      mtxdirty, 0                 // matrix registers match MTX
     lw      cmdptr, CMDPTR($zero)
     sw      $zero, STATUS($zero)
     sw      $zero, VTXCOUNT($zero)
@@ -203,7 +209,7 @@ START:
     sw      $t0, OUTLIMIT($zero)
     lw      $t0, RING_CUR($zero)
     sw      $t0, RING_PUB($zero)
-    li      $t0, 0x00010202
+    li      $t0, 0x00010202             // NZLUT: bit length of 0..15
     sw      $t0, NZLUT+0($zero)
     li      $t0, 0x03030303
     sw      $t0, NZLUT+4($zero)
@@ -213,6 +219,9 @@ START:
     li      cmdcur, CMDBUF
     li      cmdend, CMDBUF
 
+// Command dispatch. Handlers are entered with w0 / w1 loaded and cmdcur past the command,
+// and return with j cmd_next.
+    .def opok   $t1             // the opcode is in the table
 cmd_next:
     lw      w0, 0(cmdcur)               // both reloaded at cmd_have after a refill
     bne     cmdcur, cmdend, cmd_have_w1
@@ -228,18 +237,19 @@ cmd_have:
     lw      w0, 0(cmdcur)
     lw      w1, 4(cmdcur)
 cmd_have_w1:
-    srl     $t0, w0, 23
-    andi    $t0, $t0, 0x1FE             // opcode * 2
-    lhu     $t2, cmd_table - 0x20($t0)  // read before the range check (any DMEM address is fine)
-    addiu   $t0, $t0, -0x20
-    sltiu   $t1, $t0, 32
-    beqz    $t1, cmd_bad
+    srl     opofs, w0, 23
+    andi    opofs, opofs, 0x1FE         // opcode * 2
+    lhu     handler, cmd_table - 0x20(opofs) // read before the range check (any DMEM address is fine)
+    addiu   opofs, opofs, -0x20
+    sltiu   opok, opofs, 32
+    beqz    opok, cmd_bad
     addiu   cmdcur, cmdcur, 8
-    jr      $t2
+    jr      handler
     nop
+    .undef opok
 
 cmd_bad:
-    srl     $t0, w0, 24
+    srl     $t0, w0, 24                 // STATUS = 0x100 | opcode
     ori     $t0, $t0, 0x100
     sw      $t0, STATUS($zero)
 cmd_end:
@@ -256,77 +266,104 @@ cmd_end:
 // common plane.
 // The flags come from CLIPFLAGS, 8 slots per vector: slots outside the mask are replaced by
 // all ones (vmrg under VCC = mask byte), then the 32 lanes are ANDed together.
+    .def cflags $t5             // CLIPFLAGS, then the common planes (CLIP_REJECT bits), then
+                                // the bytes past the chunk
+    .def mask1  $t0             // w1 bytes 1..3: slot masks of the vectors 1..3, byte 0
+    .def mask2  $t1
+    .def mask3  $t2
+    .def mask0  $t3
+    .def skipto $t4             // bytes to skip, then the skip target (DMEM)
+    .def nextok $t1             // the next command is buffered and its opcode valid
+    .def havecmd $t3            // a command is buffered, then the target is past the chunk
+    .def vcf0   $v4             // CLIPFLAGS of slots 0-7, 8-15, 16-23, 24-31; the AND tree
+    .def vcf1   $v5
+    .def vcf2   $v12
+    .def vcf3   $v13
 cmd_cull:
     beqz    w1, cmd_next                // empty mask: nothing to test
-    li      $t5, CLIPFLAGS
-    lqv     $v4[0], 0x00($t5)
-    srl     $t0, w1, 8
-    lqv     $v5[0], 0x10($t5)
-    srl     $t1, w1, 16
-    lqv     $v12[0], 0x20($t5)
-    srl     $t2, w1, 24
-    lqv     $v13[0], 0x30($t5)
-    andi    $t3, w1, 0xFF
-    ctc2    $t3, vcc
-    andi    $t0, $t0, 0xFF
-    vmrg    $v4, $v4, vconst[7]
-    ctc2    $t0, vcc
-    andi    $t1, $t1, 0xFF
-    vmrg    $v5, $v5, vconst[7]
-    ctc2    $t1, vcc
-    vmrg    $v12, $v12, vconst[7]
-    ctc2    $t2, vcc
-    vmrg    $v13, $v13, vconst[7]
-    vand    $v4, $v4, $v5
-    sll     $t4, w0, 8
-    vand    $v12, $v12, $v13
-    srl     $t4, $t4, 5                 // bytes to skip
+    li      cflags, CLIPFLAGS
+    lqv     vcf0[0], 0x00(cflags)
+    srl     mask1, w1, 8
+    lqv     vcf1[0], 0x10(cflags)
+    srl     mask2, w1, 16
+    lqv     vcf2[0], 0x20(cflags)
+    srl     mask3, w1, 24
+    lqv     vcf3[0], 0x30(cflags)
+    andi    mask0, w1, 0xFF
+    ctc2    mask0, vcc
+    andi    mask1, mask1, 0xFF
+    vmrg    vcf0, vcf0, vconst[7]
+    ctc2    mask1, vcc
+    andi    mask2, mask2, 0xFF
+    vmrg    vcf1, vcf1, vconst[7]
+    ctc2    mask2, vcc
+    vmrg    vcf2, vcf2, vconst[7]
+    ctc2    mask3, vcc
+    vmrg    vcf3, vcf3, vconst[7]
+    vand    vcf0, vcf0, vcf1
+    sll     skipto, w0, 8
+    vand    vcf2, vcf2, vcf3
+    srl     skipto, skipto, 5           // bytes to skip
     // The AND tree is one long dependency chain: its stalls fetch and decode the next
     // command (speculatively: past the buffered chunk the words are garbage and unused)
     lw      w0, 0(cmdcur)
     lw      w1, 4(cmdcur)
-    vand    $v4, $v4, $v12
-    srl     $t0, w0, 23
-    andi    $t0, $t0, 0x1FE             // opcode * 2
-    lhu     $t2, cmd_table - 0x20($t0)
-    vand    $v4, $v4, $v4[1q]
-    addiu   $t0, $t0, -0x20
-    sltiu   $t1, $t0, 32
-    xor     $t3, cmdcur, cmdend
-    vand    $v4, $v4, $v4[2h]
-    sltu    $t3, $zero, $t3             // a command is buffered
-    and     $t1, $t1, $t3               // ... and its opcode is valid
-    addu    $t4, cmdcur, $t4            // skip target
-    vand    $v4, $v4, $v4[4]
-    mfc2    $t5, $v4[0]
-    andi    $t5, $t5, CLIP_REJECT
-    beqz    $t1, cull_redo              // refill or bad opcode
-    sltu    $t3, cmdend, $t4
-    bnez    $t5, cull_skip
-    addiu   cmdcur, cmdcur, 8           // (cull_skip restarts from $t4)
-    jr      $t2                         // no common plane: dispatch the next command
+    vand    vcf0, vcf0, vcf2
+    srl     opofs, w0, 23
+    andi    opofs, opofs, 0x1FE         // opcode * 2
+    lhu     handler, cmd_table - 0x20(opofs)
+    vand    vcf0, vcf0, vcf0[1q]
+    addiu   opofs, opofs, -0x20
+    sltiu   nextok, opofs, 32
+    xor     havecmd, cmdcur, cmdend
+    vand    vcf0, vcf0, vcf0[2h]
+    sltu    havecmd, $zero, havecmd     // a command is buffered
+    and     nextok, nextok, havecmd     // ... and its opcode is valid
+    addu    skipto, cmdcur, skipto      // skip target
+    vand    vcf0, vcf0, vcf0[4]
+    mfc2    cflags, vcf0[0]
+    andi    cflags, cflags, CLIP_REJECT
+    beqz    nextok, cull_redo           // refill or bad opcode
+    sltu    havecmd, cmdend, skipto
+    bnez    cflags, cull_skip
+    addiu   cmdcur, cmdcur, 8           // (cull_skip restarts from skipto)
+    jr      handler                     // no common plane: dispatch the next command
     nop
 cull_redo:
-    bnez    $t5, cull_skip
+    bnez    cflags, cull_skip
     nop
     j       cmd_next                    // the normal path reloads
     nop
 cull_skip:
-    beqz    $t3, cmd_next               // target inside the buffered chunk
-    move    cmdcur, $t4
-    subu    $t5, $t4, cmdend
-    addu    cmdptr, cmdptr, $t5         // past it: fetch from the target
+    beqz    havecmd, cmd_next           // target inside the buffered chunk
+    move    cmdcur, skipto
+    subu    cflags, skipto, cmdend
+    addu    cmdptr, cmdptr, cflags      // past it: fetch from the target
     j       cmd_next
     move    cmdcur, cmdend
+    .undef cflags
+    .undef mask0
+    .undef mask1
+    .undef mask2
+    .undef mask3
+    .undef skipto
+    .undef nextok
+    .undef havecmd
+    .undef vcf0
+    .undef vcf1
+    .undef vcf2
+    .undef vcf3
 
 // CALL: w1 = RDRAM address (8-byte aligned) of a command list ending with RET; one level.
 // w0 bits 23..0 = colour base for COL. The next command's RDRAM address is the fetch pointer
 // minus what is still buffered.
 cmd_call:
+    .def ret    $t0             // bytes still buffered, then the RDRAM return address
     sw      w0, COLBASE($zero)          // (DMA addresses ignore bits 31..24)
-    subu    $t0, cmdend, cmdcur
-    subu    $t0, cmdptr, $t0
-    sw      $t0, RETADDR($zero)
+    subu    ret, cmdend, cmdcur
+    subu    ret, cmdptr, ret
+    sw      ret, RETADDR($zero)
+    .undef ret
     move    cmdptr, w1
     j       cmd_next
     move    cmdcur, cmdend              // refetch from the new pointer
@@ -341,30 +378,33 @@ cmd_ret:
 // MTX, LIGHT and TEXGEN only start their DMA: the data is first read by the next VTX, whose
 // own DMA wait covers them (the DMA queue completes in order). $at != 0 tells VTX to load the
 // new matrix into registers.
-// The DMA start is inlined (here and in LIGHT / TEXGEN): back to cmd_next from the last mtc0.
+// The DMA start is inlined (here and in LIGHT / TEXGEN / COL): back to cmd_next from the
+// last mtc0.
+    .def ldst   $t1             // inline DMA start: DMEM destination, length - 1
+    .def llen   $t2
 cmd_mtx:
-    mfc0    $t0, SP_DMA_FULL
-    li      $t1, MTX
-    bnez    $t0, cmd_mtx
-    li      $t2, 63
-    mtc0    $t1, SP_MEM_ADDR
+    mfc0    dmastat, SP_DMA_FULL
+    li      ldst, MTX
+    bnez    dmastat, cmd_mtx
+    li      llen, 63
+    mtc0    ldst, SP_MEM_ADDR
     mtc0    w1, SP_DRAM_ADDR
-    mtc0    $t2, SP_RD_LEN
-    andi    $t3, w0, 1
-    li      $at, 1
+    mtc0    llen, SP_RD_LEN
+    andi    $t3, w0, 1                  // K64_KGFX_MTX_LIGHTS
+    li      mtxdirty, 1
     beqz    $t3, cmd_next
     addiu   w1, w1, 64                  // the light block (LIGHT below)
 
 // LIGHT: w1 = RDRAM address of a k64_kgfx_lights_t (LIGHTS_SIZE bytes, docs/KGFX.md).
 cmd_light:
-    mfc0    $t0, SP_DMA_FULL
-    li      $t1, LIGHTS
-    bnez    $t0, cmd_light
-    li      $t2, LIGHTS_SIZE - 1
-    mtc0    $t1, SP_MEM_ADDR
+    mfc0    dmastat, SP_DMA_FULL
+    li      ldst, LIGHTS
+    bnez    dmastat, cmd_light
+    li      llen, LIGHTS_SIZE - 1
+    mtc0    ldst, SP_MEM_ADDR
     mtc0    w1, SP_DRAM_ADDR
     j       cmd_next
-    mtc0    $t2, SP_RD_LEN
+    mtc0    llen, SP_RD_LEN
 
 // VIEWPORT: w1 = RDRAM address of 32 bytes (scale[8], trans[8]).
 cmd_viewport:
@@ -388,63 +428,81 @@ cmd_geommode_ovl:
 // VTX replaces the vertex alpha with clamp((w - start) * (Ki + Kf / 65536), 0, 0x7FFF)
 // * (2 * max + 2) >> 16 (0..max; >> 7 for max 255), w the integer clip w (eye distance),
 // through the mask 0xFF00; disabled, the mask 0xFFFF and K = 0 keep it.
+    .def fmax   $t0             // 255 - max, then FOGMUL = 2 * max + 2
+    .def fmask  $t1             // 0xFF00 (fog on) or 0xFFFF (off)
 cmd_fog:
     sw      w1, FOGDATA($zero)
-    srl     $t0, w0, 16
-    andi    $t0, $t0, 0xFF              // 255 - max
-    addiu   $t1, $t0, 1
-    srl     $t1, $t1, 8                 // 1: disabled
-    subu    $t1, $zero, $t1
-    andi    $t1, $t1, 0xFF
-    ori     $t1, $t1, 0xFF00            // mask
-    sll     $t0, $t0, 1
+    srl     fmax, w0, 16
+    andi    fmax, fmax, 0xFF            // 255 - max
+    addiu   fmask, fmax, 1
+    srl     fmask, fmask, 8             // 1: disabled
+    subu    fmask, $zero, fmask
+    andi    fmask, fmask, 0xFF
+    ori     fmask, fmask, 0xFF00        // mask
+    sll     fmax, fmax, 1
     li      $t2, 0x200
-    subu    $t0, $t2, $t0               // 2 * max + 2
-    sh      $t0, FOGMUL($zero)
+    subu    fmax, $t2, fmax             // 2 * max + 2
+    sh      fmax, FOGMUL($zero)
     sh      w0, FOGDATA+4($zero)
     j       cmd_next
-    sh      $t1, FOGDATA+6($zero)
+    sh      fmask, FOGDATA+6($zero)
+    .undef fmax
+    .undef fmask
 
 // TEXGEN: w1 = RDRAM address of a k64_kgfx_texgen_t (TEXGEN_SIZE bytes, docs/KGFX.md).
 cmd_texgen:
-    mfc0    $t0, SP_DMA_FULL
-    li      $t1, TEXGEN
-    bnez    $t0, cmd_texgen
-    li      $t2, TEXGEN_SIZE - 1
-    mtc0    $t1, SP_MEM_ADDR
+    mfc0    dmastat, SP_DMA_FULL
+    li      ldst, TEXGEN
+    bnez    dmastat, cmd_texgen
+    li      llen, TEXGEN_SIZE - 1
+    mtc0    ldst, SP_MEM_ADDR
     mtc0    w1, SP_DRAM_ADDR
     j       cmd_next
-    mtc0    $t2, SP_RD_LEN
+    mtc0    llen, SP_RD_LEN
+    .undef ldst
+    .undef llen
 
 // COL (a VTX with count 0): loads COLTAB_SIZE bytes from colour base + w1, rounded down to 8
 // bytes (DMA), into COLTAB for VTX_COLIDX. Only started: the next VTX waits for it.
+    .def csrc   $t1
+    .def cdst   $t2
+    .def clen   $t4
 cmd_col:
-    lw      $t1, COLBASE($zero)
-    li      $t2, COLTAB
-    li      $t4, COLTAB_SIZE - 1
-    addu    $t1, $t1, w1
+    lw      csrc, COLBASE($zero)
+    li      cdst, COLTAB
+    li      clen, COLTAB_SIZE - 1
+    addu    csrc, csrc, w1
 col_dma:
-    mfc0    $t0, SP_DMA_FULL
-    bnez    $t0, col_dma
+    mfc0    dmastat, SP_DMA_FULL
+    bnez    dmastat, col_dma
     nop
-    mtc0    $t2, SP_MEM_ADDR
-    mtc0    $t1, SP_DRAM_ADDR
+    mtc0    cdst, SP_MEM_ADDR
+    mtc0    csrc, SP_DRAM_ADDR
     j       cmd_next
-    mtc0    $t4, SP_RD_LEN
+    mtc0    clen, SP_RD_LEN
+    .undef csrc
+    .undef cdst
+    .undef clen
 
 // VTX_COLIDX pass (resident: VTX jumps here after its DMA): each input vertex's rgba becomes
 // the COLTAB word at byte offset a. $t2 = INBUF, $t3 = count.
+    .def ciptr  $t2             // input vertex
+    .def ciend  $t5
+    .def cival  $t6             // a, then the COLTAB word
 vtx_colidx:
-    sll     $t5, $t3, 4
-    addu    $t5, $t5, $t2
+    sll     ciend, $t3, 4
+    addu    ciend, ciend, ciptr
 ci_loop:
-    lbu     $t6, 11($t2)
-    addiu   $t2, $t2, 16
-    lw      $t6, COLTAB($t6)
-    bne     $t2, $t5, ci_loop
-    sw      $t6, 8 - 16($t2)
+    lbu     cival, 11(ciptr)
+    addiu   ciptr, ciptr, 16
+    lw      cival, COLTAB(cival)
+    bne     ciptr, ciend, ci_loop
+    sw      cival, 8 - 16(ciptr)
     j       vtx_ci_done
     nop
+    .undef ciptr
+    .undef ciend
+    .undef cival
 
 // RDP: w1 = RDRAM address (8-byte aligned) of raw RDP commands, w0 bits 7..0 = bytes - 1
 // (up to 256, a multiple of 8). The pending triangles go out first, so the commands land at
@@ -479,112 +537,135 @@ OVL_SLOT:
 // vertices (count 0: COL).
 //   in:  s16 x, y, z, pad; u8 r, g, b, a; s16 s, t (colidx: a = COLTAB byte offset of rgba)
 //   out: VCACHE[dest..dest+count) (VCACHE_STRIDE bytes each, see docs/KGFX.md)
+    .def vcount $t3             // vertices left (counts down by 2 per pair)
+    .def vdest  $t4             // dest slot (setup)
+    .def vout   $a1             // VCACHE address of the current pair's vertex A
+    .def vinp   $a2             // input vertex (INBUF)
+    .def vflag  $gp             // CLIPFLAGS entry of the current pair
+    .def nibmsk $s4             // 0x03030707: clip flag nibbles of A (B after >> 4)
+    .def bytmsk $s5             // 0x00FF00FF
+    .def lmode  $t0             // LIGHTMODE: first pass << 16 | return
+    .def vfirst $t1             // first pass: vtx_loop, light_verts or texgen_verts
 cmd_vtx:
-    srl     $t3, w0, 8
-    andi    $t3, $t3, 0xFF              // count
-    beqz    $t3, cmd_col
-    srl     $t4, w0, 16
+    srl     vcount, w0, 8
+    andi    vcount, vcount, 0xFF        // count
+    beqz    vcount, cmd_col
+    srl     vdest, w0, 16
     // The vertex DMA is started inline; the setup below runs while it is in flight.
 vtx_dma:
-    mfc0    $t0, SP_DMA_FULL
-    sll     $t2, $t3, 4
-    bnez    $t0, vtx_dma
-    addiu   $t2, $t2, -1
+    mfc0    dmastat, SP_DMA_FULL
+    sll     $t2, vcount, 4
+    bnez    dmastat, vtx_dma
+    addiu   $t2, $t2, -1                // length - 1
     li      $t1, INBUF
     mtc0    $t1, SP_MEM_ADDR
     mtc0    w1, SP_DRAM_ADDR
     mtc0    $t2, SP_RD_LEN
-    andi    $t4, $t4, 0xFF              // dest
+    andi    vdest, vdest, 0xFF          // dest
     lw      $t0, VTXCOUNT($zero)
-    sll     $t1, $t4, 3
-    sll     $gp, $t4, 1
-    addu    $t0, $t0, $t3
+    sll     $t1, vdest, 3
+    sll     vflag, vdest, 1
+    addu    $t0, $t0, vcount
     sw      $t0, VTXCOUNT($zero)
-    sll     $t0, $t4, 5
-    addu    $a1, $t0, $t1
-    lw      $t0, LIGHTMODE($zero)       // passes: first << 16 | return
-    addiu   $a1, $a1, VCACHE            // out = VCACHE + dest * 40
-    addiu   $gp, $gp, CLIPFLAGS         // CLIPFLAGS + dest * 2
-    li      $a2, INBUF                  // in
-    srl     $t1, $t0, 16
-    li      $s4, 0x03030707             // clip flag nibble masks (vtx_iter)
-    li      $s5, 0x00FF00FF
+    sll     $t0, vdest, 5
+    addu    vout, $t0, $t1
+    lw      lmode, LIGHTMODE($zero)     // passes: first << 16 | return
+    addiu   vout, vout, VCACHE          // out = VCACHE + dest * 40
+    addiu   vflag, vflag, CLIPFLAGS     // CLIPFLAGS + dest * 2
+    li      vinp, INBUF                 // in
+    srl     vfirst, lmode, 16
+    li      nibmsk, 0x03030707          // clip flag nibble masks (vtx_iter)
+    li      bytmsk, 0x00FF00FF
 vtx_dma_wait:                           // also covers MTX / LIGHT / TEXGEN / COL (in-order queue)
     mfc0    $t5, SP_DMA_BUSY
     bnez    $t5, vtx_dma_wait
-    andi    $t5, w0, 1
+    andi    $t5, w0, 1                  // colidx
     bnez    $t5, vtx_colidx
     li      $t2, INBUF
 vtx_ci_done:
-    beqz    $at, vtx_mtx_ok
+    beqz    mtxdirty, vtx_mtx_ok
     nop
     jal     load_matrix
-    li      $at, 0
+    li      mtxdirty, 0
 vtx_mtx_ok:
-    jr      $t1                         // vtx_loop, or light_verts / texgen_verts first
-    andi    $ra, $t0, 0xFFFF
+    jr      vfirst                      // vtx_loop, or light_verts / texgen_verts first
+    andi    $ra, lmode, 0xFFFF
 vtx_texgen:                             // lighting, then texgen
     j       texgen_verts
     li      $ra, vtx_loop
+    .undef vdest
+    .undef lmode
+    .undef vfirst
 
+    .def outa   $t9             // VCACHE address of the previous pair's vertex A, B
+    .def outb   $t8
+    .def flga   $k0             // CLIPFLAGS entry of the previous pair's A, B
+    .def flgb   $k1
+    .def hasb   $t5             // 1: the pair has a vertex B, then B's offsets (scratch)
+    .def bflg   $a0             // CLIPFLAGS offset of B: 2, or 0 without B
+    .def bout   $a3             // VCACHE offset of B: VCACHE_STRIDE, or 0 without B
+    .def ccw    $t0             // VCC of the +-W compare, then of +-4W
+    .def ccg    $t1             // ... merged: 4W << 16 | W
+    .def flaga  $t2             // packed clip flags of A, B (stored a pair later)
+    .def flagb  $t7
 vtx_loop:
     // Software-pipelined over vertex pairs: each iteration transforms pair k (clip, 1/w, clip
-    // flags) and finishes pair k - 1 (NDC, screen, all stores to $t9 = vertex A, $t8 = B).
+    // flags) and finishes pair k - 1 (NDC, screen, all stores to outa = vertex A, outb = B).
     // Pair -1 is junk stored over slot `dest` (pair 0 overwrites it); vtx_last finishes the
-    // last pair. When a pair has no vertex B, $t8 = $t9 and every B store comes before the
+    // last pair. When a pair has no vertex B, outb = outa and every B store comes before the
     // matching A store.
-    li      $k0, FOGMUL
-    move    $t9, $a1
-    move    $t8, $a1
+    li      flga, FOGMUL
+    move    outa, vout
+    move    outb, vout
     ldv     vfog[0], FOGDATA - 0x1000($zero) // (DMEM wraps; v27.. are free after light / texgen)
     ldv     vfog[8], FOGDATA - 0x1000($zero)
-    lsv     vfmul[0], 0($k0)
-    move    $k0, $gp                    // flags of the previous pair: A, B
-    move    $k1, $gp
+    lsv     vfmul[0], 0(flga)
+    move    flga, vflag                 // flags of the previous pair: A, B
+    move    flgb, vflag
 vtx_iter:
-    ldv     vin[0], 0($a2)
+    ldv     vin[0], 0(vinp)
     vmudl   vtmp, vcf, vrcf[3h]         // previous pair: NDC = clip * 1/w (32x32 -> s15.16)
-    ldv     vin[8], 16($a2)
+    ldv     vin[8], 16(vinp)
     vmadm   vtmp, vci, vrcf[3h]
-    slti    $t5, $t3, 2                 // this pair has no vertex B: its B stores go to A
+    slti    hasb, vcount, 2             // this pair has no vertex B: its B stores go to A
     vmadn   vnf, vcf, vrci[3h]
-    xori    $t5, $t5, 1                 // (no store two cycles after a load)
+    xori    hasb, hasb, 1               // (no store two cycles after a load)
     vmadh   vni, vci, vrci[3h]
-    sdv     vattr[8], 0x20($t8)
+    sdv     vattr[8], 0x20(outb)
     vmudh   vtmp, vtrans, vconst[1]     // screen = trans + NDC * scale
-    sdv     vattr[0], 0x20($t9)
+    sdv     vattr[0], 0x20(outa)
     vor     vfb, vfa, vfd               // previous pair's b << 8 | fog alpha
-    sdv     vci[8], 0x00($t8)
+    sdv     vci[8], 0x00(outb)
     vmadn   vtmp, vnf, vscale
-    sdv     vci[0], 0x00($t9)
+    sdv     vci[0], 0x00(outa)
     vmadh   vscr, vni, vscale
-    sdv     vcf[8], 0x08($t8)
-    sdv     vcf[0], 0x08($t9)
-    ldv     vattr[0], 8($a2)
+    sdv     vcf[8], 0x08(outb)
+    sdv     vcf[0], 0x08(outa)
+    ldv     vattr[0], 8(vinp)
 
     vmudn   vtmp, vmf3, vconst[1]       // clip = M * (x, y, z, 1)
-    ldv     vattr[8], 24($a2)
+    ldv     vattr[8], 24(vinp)
     vmadh   vtmp, vmi3, vconst[1]
-    addiu   $a2, $a2, 32
+    addiu   vinp, vinp, 32
     vmadn   vtmp, vmf0, vin[0h]
-    sll     $a0, $t5, 1
+    sll     bflg, hasb, 1
     vmadh   vtmp, vmi0, vin[0h]
-    ssv     vrcf[14], 0x18($t8)
+    ssv     vrcf[14], 0x18(outb)
     vmadn   vtmp, vmf1, vin[1h]
-    ssv     vrcf[6], 0x18($t9)
+    ssv     vrcf[6], 0x18(outa)
     vmadh   vtmp, vmi1, vin[1h]
-    sh      $t7, 0x1A($t8)
+    sh      flagb, 0x1A(outb)
     vmadn   vcf, vmf2, vin[2h]
-    sh      $t2, 0x1A($t9)
+    sh      flaga, 0x1A(outa)
     vmadh   vci, vmi2, vin[2h]
     // previous pair: z >= 0 (rounding puts near-plane vertices at -1, -2, and the triangle
     // setup needs z deltas inside s16), 1/w integer in lanes 3, 7 before it is replaced
     vge     vzc, vscr, vzero
-    sh      $t7, 0($k1)                 // flags of the previous pair
+    sh      flagb, 0(flgb)              // flags of the previous pair
     vmov    vscr[3], vrci[3]
-    sh      $t2, 0($k0)
+    sh      flaga, 0(flga)
     vmov    vscr[7], vrci[7]
-    move    $k0, $gp
+    move    flga, vflag
     vsub    vfd, vci, vfog[0]           // fog of this pair: w - start (lanes 3, 7)
     // W normalize: clip *= K (16.16: integer in viewport scale lane 3, fraction in trans lane
     // 3). A uniform scale keeps NDC, the clip compares and the guard band; it brings W near 1
@@ -598,109 +679,123 @@ vtx_iter:
     // per lane (A in lanes 0..3, B in 4..7). Both compares come first, so that the flag
     // decode pairs with the reciprocal.
     vmudn   vtmp, vcf, vconst[4]        // 4W
-    addu    $k1, $gp, $a0
+    addu    flgb, vflag, bflg
     vmadh   v4wi, vci, vconst[4]
-    addiu   $gp, $gp, 4
+    addiu   vflag, vflag, 4
     vmadn   v4wf, vzero, vzero[0]
-    sll     $a3, $t5, 5
+    sll     bout, hasb, 5
     vch     vtmp, vci, vci[3h]
-    sll     $t5, $t5, 3
+    sll     hasb, hasb, 3
     vcl     vtmp, vcf, vcf[3h]
-    addu    $a3, $a3, $t5
+    addu    bout, bout, hasb            // 40 or 0
     vmudm   vtmp, vfd, vfog[2]          // * (Ki + Kf / 65536), clamped to s16
-    ssv     vfb[14], 0x22($t8)          // previous pair: b << 8 | fog alpha (B first)
+    ssv     vfb[14], 0x22(outb)         // previous pair: b << 8 | fog alpha (B first)
     vmadh   vfd, vfd, vfog[1]
-    ssv     vfb[6], 0x22($t9)
-    cfc2    $t0, vcc
+    ssv     vfb[6], 0x22(outa)
+    cfc2    ccw, vcc
     vch     vtmp, vci, v4wi[3h]
     vcl     vtmp, vcf, v4wf[3h]
     // 1/w (32-bit reciprocal of the s15.16 w: result = 2^31 / W, i.e. 0.5/w in s15.16)
     vrcph   vrci[3], vci[3]
-    cfc2    $t1, vcc
+    cfc2    ccg, vcc
     vrcpl   vrcf[3], vcf[3]
-    andi    $t0, $t0, 0xFFFF            // (cfc2 sign-extends)
-    // Flags: VCC (+-W) in the low half of $t1, VCC (+-4W) in the high half; each byte's low
+    andi    ccw, ccw, 0xFFFF            // (cfc2 sign-extends)
+    // Flags: VCC (+-W) in the low half of ccg, VCC (+-4W) in the high half; each byte's low
     // nibble holds A's bits, its high nibble B's. Packing the four nibbles gives
     // -x -y -z . +x +y +z . -4x -4y . . +4x +4y (K64_KGFX_CLIP_*).
     vrcph   vrci[3], vzero[0]
-    addiu   $t3, $t3, -2
+    addiu   vcount, vcount, -2
     vrcph   vrci[7], vci[7]
-    sll     $t1, $t1, 16
+    sll     ccg, ccg, 16
     vge     vfd, vfd, vzero             // (VCC is free after the cfc2)
-    or      $t1, $t1, $t0
+    or      ccg, ccg, ccw
     vrcpl   vrcf[7], vcf[7]
-    and     $t2, $t1, $s4               // A: 0x03030707
+    and     flaga, ccg, nibmsk          // A: 0x03030707
     vrcph   vrci[7], vzero[0]
-    srl     $t7, $t1, 4
+    srl     flagb, ccg, 4
     vsubc   vwnf, vzero, vcf            // -w for the Newton-Raphson step
-    and     $t7, $t7, $s4               // B
+    and     flagb, flagb, nibmsk        // B
     vsub    vwni, vzero, vci
-    srl     $t4, $t2, 4
+    srl     $t4, flaga, 4
     vmudn   vrcf, vrcf, vconst[2]       // x2 -> 1/w
-    or      $t2, $t2, $t4
+    or      flaga, flaga, $t4
     vmadh   vrci, vrci, vconst[2]
-    srl     $t5, $t7, 4
+    srl     $t5, flagb, 4
     vmadn   vrcf, vzero, vzero[0]
-    or      $t7, $t7, $t5
+    or      flagb, flagb, $t5
     vmov    vscr[2], vzc[2]             // z >= 0
-    and     $t2, $t2, $s5               // 0x00FF00FF
+    and     flaga, flaga, bytmsk        // 0x00FF00FF
     vmov    vscr[6], vzc[6]
-    and     $t7, $t7, $s5
+    and     flagb, flagb, bytmsk
     vmudl   vfd, vfd, vfmul[0]          // * (2 * max + 2) >> 16: 0..max
     // one Newton-Raphson step: x1 = x0 * (2 - w * x0)  (table result is ~11 bits)
     vmudl   vtmp, vwnf, vrcf
-    srl     $t4, $t2, 8
+    srl     $t4, flaga, 8
     vmadm   vtmp, vwni, vrcf
-    or      $t2, $t2, $t4               // (bits 16.. are junk: stored with sh)
+    or      flaga, flaga, $t4           // (bits 16.. are junk: stored with sh)
     vmadn   vnf, vwnf, vrci
-    srl     $t5, $t7, 8
+    srl     $t5, flagb, 8
     vmadh   vni, vwni, vrci
-    or      $t7, $t7, $t5
+    or      flagb, flagb, $t5
     vmudn   vtmp, vrcf, vconst[2]       // x0 * (2 - w * x0) = 2 * x0 + x0 * (-w * x0)
-    sdv     vscr[8], 0x10($t8)
+    sdv     vscr[8], 0x10(outb)
     vmadh   vtmp, vrci, vconst[2]
-    sdv     vscr[0], 0x10($t9)
+    sdv     vscr[0], 0x10(outa)
     vmadl   vtmp, vrcf, vnf
     vmadm   vtmp, vrci, vnf
-    move    $t9, $a1
+    move    outa, vout
     vmadn   vrcf, vrcf, vni
-    addu    $t8, $a1, $a3
+    addu    outb, vout, bout
     vmadh   vrci, vrci, vni
-    addiu   $a1, $a1, 2 * VCACHE_STRIDE
-    bgtz    $t3, vtx_iter
+    addiu   vout, vout, 2 * VCACHE_STRIDE
+    bgtz    vcount, vtx_iter
     vand    vfa, vfog, vattr[1h]        // b, a & mask (lanes 3, 7)
 
 vtx_last:                               // stage B of vtx_iter for the last pair
     vmudl   vtmp, vcf, vrcf[3h]
-    sdv     vattr[8], 0x20($t8)
+    sdv     vattr[8], 0x20(outb)
     vmadm   vtmp, vci, vrcf[3h]
-    sdv     vattr[0], 0x20($t9)
+    sdv     vattr[0], 0x20(outa)
     vmadn   vnf, vcf, vrci[3h]
-    sdv     vci[8], 0x00($t8)
+    sdv     vci[8], 0x00(outb)
     vmadh   vni, vci, vrci[3h]
-    sdv     vci[0], 0x00($t9)
+    sdv     vci[0], 0x00(outa)
     vmudh   vtmp, vtrans, vconst[1]
-    sdv     vcf[8], 0x08($t8)
+    sdv     vcf[8], 0x08(outb)
     vmadn   vtmp, vnf, vscale
-    sdv     vcf[0], 0x08($t9)
+    sdv     vcf[0], 0x08(outa)
     vmadh   vscr, vni, vscale
-    ssv     vrcf[14], 0x18($t8)
+    ssv     vrcf[14], 0x18(outb)
     vor     vfb, vfa, vfd
-    ssv     vrcf[6], 0x18($t9)
-    sh      $t7, 0x1A($t8)
-    sh      $t2, 0x1A($t9)
+    ssv     vrcf[6], 0x18(outa)
+    sh      flagb, 0x1A(outb)
+    sh      flaga, 0x1A(outa)
     vge     vtmp, vscr, vzero
-    sh      $t7, 0($k1)
+    sh      flagb, 0(flgb)
     vmov    vscr[3], vrci[3]
-    sh      $t2, 0($k0)
+    sh      flaga, 0(flga)
     vmov    vscr[7], vrci[7]
     vmov    vscr[2], vtmp[2]
     vmov    vscr[6], vtmp[6]
-    sdv     vscr[8], 0x10($t8)
-    sdv     vscr[0], 0x10($t9)
-    ssv     vfb[14], 0x22($t8)
+    sdv     vscr[8], 0x10(outb)
+    sdv     vscr[0], 0x10(outa)
+    ssv     vfb[14], 0x22(outb)
     j       cmd_next
-    ssv     vfb[6], 0x22($t9)
+    ssv     vfb[6], 0x22(outa)
+    .undef outa
+    .undef outb
+    .undef flga
+    .undef flgb
+    .undef hasb
+    .undef bflg
+    .undef bout
+    .undef ccw
+    .undef ccg
+    .undef flaga
+    .undef flagb
+    .undef nibmsk
+    .undef bytmsk
+    .undef vflag
 
 
 // Lighting pass over INBUF ($t3 vertices, in pairs; keeps $a1, $a2, $t3): replaces each
@@ -730,74 +825,89 @@ vtx_last:                               // stage B of vtx_iter for the last pair
 // of the current pair's N . L and light chains. The loop runs pairs + 1 times; the second
 // iteration stores junk over pair 0's colors after loading them, the last one computes a junk
 // pair past the input and decodes / loads the two after it (reads only).
+    .def lcur   $t8             // LIGHTS, then the current pair in INBUF
+    .def lcurb  $t4             // current pair + 4 (B's colour at 20..27 via luv 16)
+    .def lbase  $t7             // LIGHTS (suv base: LIGHTTMP is past the 0x7F luv/suv reach)
+    .def lst    $t9             // pair stored this iteration
+    .def lprev  $k0             // previous pair
+    .def lcola  $t1             // lit colours read back from LIGHTTMP: A, B
+    .def lcolb  $t2
+    .def lcnt   $t5             // iterations left (pairs + 1)
+    .def lvcc   $t6             // 0xF0: VCC selecting lanes 4..7
 light_verts:
-    li      $t8, LIGHTS
-    lqv     vldx[0], 0x00($t8)
-    lqv     vldy[0], 0x10($t8)
-    lqv     vldz[0], 0x20($t8)
-    lqv     vlc0[0], 0x30($t8)
-    lqv     vlc1[0], 0x40($t8)
-    lqv     vlc2[0], 0x50($t8)
-    lqv     vlc3[0], 0x60($t8)
-    lqv     vlamb[0], 0x70($t8)
-    lqv     vnsh[0], 0x80($t8)
-    lqv     vnmsk[0], 0x90($t8)
-    move    $t7, $t8
-    li      $t8, INBUF                  // current pair
-    ldv     vin[8], 16($t8)
-    ldv     vin[0], 0($t8)
-    li      $t9, INBUF                  // pair stored this iteration
-    move    $k0, $t9                    // previous pair
-    lw      $t1, 8($t9)                 // first store: pair 0's own colors (no-op)
-    lw      $t2, 24($t9)
-    addiu   $t5, $t3, 3
-    srl     $t5, $t5, 1                 // pairs + 1 (an odd count lights one junk slot of INBUF)
-    li      $t6, 0xF0                   // VCC: lanes 4..7
+    li      lcur, LIGHTS
+    lqv     vldx[0], 0x00(lcur)
+    lqv     vldy[0], 0x10(lcur)
+    lqv     vldz[0], 0x20(lcur)
+    lqv     vlc0[0], 0x30(lcur)
+    lqv     vlc1[0], 0x40(lcur)
+    lqv     vlc2[0], 0x50(lcur)
+    lqv     vlc3[0], 0x60(lcur)
+    lqv     vlamb[0], 0x70(lcur)
+    lqv     vnsh[0], 0x80(lcur)
+    lqv     vnmsk[0], 0x90(lcur)
+    move    lbase, lcur
+    li      lcur, INBUF                 // current pair
+    ldv     vin[8], 16(lcur)
+    ldv     vin[0], 0(lcur)
+    li      lst, INBUF                  // pair stored this iteration
+    move    lprev, lst                  // previous pair
+    lw      lcola, 8(lst)               // first store: pair 0's own colors (no-op)
+    lw      lcolb, 24(lst)
+    addiu   lcnt, vcount, 3
+    srl     lcnt, lcnt, 1               // pairs + 1 (an odd count lights one junk slot of INBUF)
+    li      lvcc, 0xF0                  // VCC: lanes 4..7
     vmudn   vtmp, vnsh, vin[3h]         // pad << 0, 5, 11 in the accumulator low half
-    ldv     vin[8], 48($t8)             // pair 1
+    ldv     vin[8], 48(lcur)            // pair 1
     vsar    vni, vni, vni[2]
-    ldv     vin[0], 32($t8)
+    ldv     vin[0], 32(lcur)
     vand    vni, vni, vnmsk             // pair 0 normal x, y, z (Q15)
 // Each iteration stores the colors read back at the end of the one before (two pairs back),
 // so the suv -> lw -> sw round trip stays off the vector chain; the last one is stored on exit.
 light_loop:
     vmulf   vscr, vlit, vcol            // previous pair: light * color
-    sw      $t1, 8($t9)
+    sw      lcola, 8(lst)
     vmulf   vtmp, vldx, vni[0h]
-    sw      $t2, 24($t9)
+    sw      lcolb, 24(lst)
     vmacf   vtmp, vldy, vni[1h]
-    addiu   $t4, $t8, 4
+    addiu   lcurb, lcur, 4
     vmacf   vnf, vldz, vni[2h]          // N . L per light (Q14)
-    luv     vci[0], 8($t8)              // A r g b a (u8 << 7)
+    luv     vci[0], 8(lcur)             // A r g b a (u8 << 7)
     vmudn   vtmp, vnsh, vin[3h]         // next pair's normals (vni is consumed above)
-    luv     vcf[0], 16($t4)             // B r g b a in lanes 4..7 (bytes 20..27)
+    luv     vcf[0], 16(lcurb)           // B r g b a in lanes 4..7 (bytes 20..27)
     vsar    vnn, vnn, vnn[2]
-    ldv     vin[8], 80($t8)             // the pair after
+    ldv     vin[8], 80(lcur)            // the pair after
     vadd    vscr, vscr, vscr
-    ldv     vin[0], 64($t8)
+    ldv     vin[0], 64(lcur)
     vge     vnf, vnf, vzero
-    move    $t9, $k0
+    move    lst, lprev
     vand    vni, vnn, vnmsk
-    ctc2    $t6, vcc
+    ctc2    lvcc, vcc
     vmrg    vcol, vcf, vci              // vertex colors: A lanes 0..3, B 4..7
-    suv     vscr[0], LIGHTTMP - LIGHTS($t7)
+    suv     vscr[0], LIGHTTMP - LIGHTS(lbase)
     vmudh   vtmp, vlamb, vconst[1]
-    move    $k0, $t8
+    move    lprev, lcur
     vmacf   vtmp, vlc0, vnf[0h]
-    addiu   $t5, $t5, -1
+    addiu   lcnt, lcnt, -1
     vmacf   vtmp, vlc1, vnf[1h]
-    lw      $t1, LIGHTTMP + 0($zero)
+    lw      lcola, LIGHTTMP + 0($zero)
     vmacf   vtmp, vlc2, vnf[2h]
-    lw      $t2, LIGHTTMP + 4($zero)
+    lw      lcolb, LIGHTTMP + 4($zero)
     vmacf   vlit, vlc3, vnf[3h]         // light per channel (Q14, saturates at 2.0)
-    bnez    $t5, light_loop
-    addiu   $t8, $t8, 32
-    sw      $t1, 8($t9)
+    bnez    lcnt, light_loop
+    addiu   lcur, lcur, 32
+    sw      lcola, 8(lst)
     jr      $ra
-    sw      $t2, 24($t9)
+    sw      lcolb, 24(lst)
     .undef vlit
     .undef vcol
     .undef vnn
+    .undef lcurb
+    .undef lbase
+    .undef lprev
+    .undef lcola
+    .undef lcolb
+    .undef lvcc
 
 // Texture coordinate pass over INBUF ($t3 vertices, in pairs; keeps $a1, $a2, $t3): s, t =
 // off + scale * (N . axis) / 2, with the two model-space view axes (Q14, lanes 0, 1 for
@@ -808,45 +918,51 @@ light_loop:
 // pairs + 1 times; the first iteration stores junk over pair 0's s, t, the last one computes
 // a junk pair past the input (reads only).
 texgen_verts:
-    li      $t8, TEXGEN
-    lqv     vldx[0], 0x00($t8)
-    lqv     vldy[0], 0x10($t8)
-    lqv     vldz[0], 0x20($t8)
-    lqv     vlc0[0], 0x30($t8)          // scale
-    lqv     vlc1[0], 0x40($t8)          // offset
-    lqv     vnsh[0], 0x50($t8)
-    lqv     vnmsk[0], 0x60($t8)
-    li      $t8, INBUF                  // current pair
-    ldv     vin[0], 0($t8)
-    ldv     vin[8], 16($t8)
-    move    $t9, $t8                    // previous pair (stores)
-    addiu   $t5, $t3, 3
-    srl     $t5, $t5, 1                 // pairs + 1
+    li      lcur, TEXGEN
+    lqv     vldx[0], 0x00(lcur)
+    lqv     vldy[0], 0x10(lcur)
+    lqv     vldz[0], 0x20(lcur)
+    lqv     vlc0[0], 0x30(lcur)         // scale
+    lqv     vlc1[0], 0x40(lcur)         // offset
+    lqv     vnsh[0], 0x50(lcur)
+    lqv     vnmsk[0], 0x60(lcur)
+    li      lcur, INBUF                 // current pair
+    ldv     vin[0], 0(lcur)
+    ldv     vin[8], 16(lcur)
+    move    lst, lcur                   // previous pair (stores)
+    addiu   lcnt, vcount, 3
+    srl     lcnt, lcnt, 1               // pairs + 1
     vmudn   vtmp, vnsh, vin[3h]
-    ldv     vin[0], 32($t8)             // pair 1
+    ldv     vin[0], 32(lcur)            // pair 1
     vsar    vni, vni, vni[2]
-    ldv     vin[8], 48($t8)
+    ldv     vin[8], 48(lcur)
     vand    vni, vni, vnmsk             // pair 0 normal x, y, z (Q15)
 texgen_loop:
     vmulf   vtmp, vldx, vni[0h]
-    slv     vnf[0], 12($t9)
+    slv     vnf[0], 12(lst)
     vmacf   vtmp, vldy, vni[1h]
-    slv     vnf[8], 28($t9)
+    slv     vnf[8], 28(lst)
     vmacf   vnf, vldz, vni[2h]          // N . axis (Q14)
-    move    $t9, $t8
+    move    lst, lcur
     vmudn   vtmp, vnsh, vin[3h]         // next pair's normals
-    ldv     vin[0], 64($t8)             // the pair after
+    ldv     vin[0], 64(lcur)            // the pair after
     vsar    vnn, vnn, vnn[2]
-    ldv     vin[8], 80($t8)
+    ldv     vin[8], 80(lcur)
     vmudh   vtmp, vlc1, vconst[1]
-    addiu   $t5, $t5, -1
+    addiu   lcnt, lcnt, -1
     vmacf   vnf, vlc0, vnf              // s, t (s10.5)
     vand    vni, vnn, vnmsk
-    bnez    $t5, texgen_loop
-    addiu   $t8, $t8, 32
+    bnez    lcnt, texgen_loop
+    addiu   lcur, lcur, 32
     jr      $ra
     nop
     .undef vnn
+    .undef lcur
+    .undef lst
+    .undef lcnt
+    .undef vcount
+    .undef vout
+    .undef vinp
 
     .balign 8
     .global OVL_VTX_END
@@ -858,16 +974,18 @@ OVL_VTX_END:
 
 // TRI: w0 bits 23..0 = vertex cache slots a, b, c; w1 = a second triangle in the same form,
 // present when its bits 31..24 are non-zero.
+    .def tret   $s7             // tri / tri_go return address (tri_clip saves it in $fp)
+    .def tri2   $s4             // cmd_tri's second triangle (kept across the clipper)
 cmd_tri:
-    ori     $s7, $zero, cmd_tri_2       // tri returns to $s7
+    ori     tret, $zero, cmd_tri_2      // tri returns to tret
     j       tri
-    move    $s4, w1
+    move    tri2, w1
 cmd_tri_2:
-    srl     $t0, $s4, 24
+    srl     $t0, tri2, 24
     beqz    $t0, cmd_next
-    move    w0, $s4                     // reloaded at cmd_next
+    move    w0, tri2                    // reloaded at cmd_next
     j       tri                         // tail call: returns straight to cmd_next
-    ori     $s7, $zero, cmd_next
+    ori     tret, $zero, cmd_next
 
 // ---- triangle setup --------------------------------------------------------------------------
 // Same math and output as k64_rdp_tri (src/gfx/tri.c), in fixed point. The method follows
@@ -905,9 +1023,30 @@ cmd_tri_2:
     .def p2     $a2
     .def p3     $a3
     .def lft    $s5             // major edge on the left
+    .def cullm  $t7             // CULLMODE: bit 31 culls back faces, bit 0 front faces
+    .def olim   $t5             // OUTLIMIT: last outptr with room for TRI_MAX bytes
+    .def fl1    $t0             // clip flags of p1, p2, p3 (before the sort)
+    .def fl2    $t1
+    .def fl3    $t2
+    .def clipor $t4             // fl1 | fl2 | fl3, reject / clip bits
+    .def py1    $t0             // screen y of p1, p2, p3 (s13.2), swapped with them
+    .def py2    $t1
+    .def py3    $t2
+    .def ylt    $t3             // sort: swap needed
+    .def swp    $t4             // sort: swap temporary
+    .def gmode  $t9             // GEOMMODE (op << 24 | level << 19 | tile << 16), then K64_TRI_*
+    .def tend   $t8             // outptr + 32: the end of a flat (edge-only) triangle
+    .def nzv    $t2             // NZ, then NZ' = NZ >> nzk
+    .def nzk    $t6             // NZ normalization shift k (0 for |NZ| < 2^16)
+    .def wv2    $t2             // W of p2, p3 (s15.16 as int << 16 | frac)
+    .def wv3    $t3
+    .def minw   $t0             // W of p1, then the smallest W
+    .def blksh  $t0             // shade, texture, z coefficient blocks in OUTBUF (TRIOFS)
+    .def blktx  $t1
+    .def blkz   $t2
 
-// Triangle p1, p2, p3 (VCACHE addresses of projected vertices) -> RDP command; returns to $s7.
-// tri itself (w0 = slots) is entered with $s7 set by the caller.
+// Triangle p1, p2, p3 (VCACHE addresses of projected vertices) -> RDP command; returns to tret.
+// tri itself (w0 = slots) is entered with tret set by the caller.
 // Entry for the clipper: the face-culling product, then the common path.
 tri_go:
     llv     vhml[0], 0x10(p2)
@@ -941,60 +1080,60 @@ tri:
     sll     $t2, w0, 3
     andi    p3, $t2, 0x7F8
     llv     vmm[0], 0x10(p3)
-    lhu     $t0, 0x1A(p1)
+    lhu     fl1, 0x1A(p1)
     vsub    vneg, vtf, vhml             // p1 - p2
-    lhu     $t1, 0x1A(p2)
+    lhu     fl2, 0x1A(p2)
     vsub    vhml, vhml, vtf             // e1 = p2 - p1 (lanes 0 x, 1 y)
-    lhu     $t2, 0x1A(p3)
-    lw      $t7, CULLMODE($zero)
+    lhu     fl3, 0x1A(p3)
+    lw      cullm, CULLMODE($zero)
     vsub    vmm, vmm, vtf               // e2 = p3 - p1
-    or      $t4, $t0, $t1
-    or      $t4, $t4, $t2
-    andi    $t4, $t4, CLIP_REJECT | CLIP_PLANES_MASK
+    or      clipor, fl1, fl2
+    or      clipor, clipor, fl3
+    andi    clipor, clipor, CLIP_REJECT | CLIP_PLANES_MASK
     vmudh   vjunk, vhml, vmm[1]         // e1x*e2y + e2x*(p1y - p2y); the clamped high half
     vmadh   vnzi, vmm, vneg[1]          // has the sign of the sum
-    bnez    $t4, tri_rejclip            // off screen: rejected, clipped or back to tri_vis
-    lw      $t5, OUTLIMIT($zero)
+    bnez    clipor, tri_rejclip         // off screen: rejected, clipped or back to tri_vis
+    lw      olim, OUTLIMIT($zero)
 tri_vis:
-    lh      $t0, 0x12(p1)
-    lh      $t1, 0x12(p2)
+    lh      py1, 0x12(p1)
+    lh      py2, 0x12(p2)
     mfc2    $t6, vnzi[0]
-    lh      $t2, 0x12(p3)
+    lh      py3, 0x12(p3)
     // cull first: a culled triangle ends here. sra gives shift 0 (back) or 31 (front), which
     // brings CULLMODE bit 31 or bit 0 to the sign.
     sra     $t6, $t6, 31
-    sllv    $t4, $t7, $t6
+    sllv    $t4, cullm, $t6
     bltz    $t4, tri_done
-    sltu    $t5, $t5, outptr            // no room for TRI_MAX bytes in this OUTBUF half
-    bnez    $t5, tri_flush
+    sltu    olim, olim, outptr          // no room for TRI_MAX bytes in this OUTBUF half
+    bnez    olim, tri_flush
     // Sort by screen y (same comparisons as k64_rdp_tri).
-    slt     $t3, $t1, $t0
+    slt     ylt, py2, py1
 tri_sort:
-    beqz    $t3, tri_s1
-    move    $t4, p1                    // $t4 is dead at tri_s1
+    beqz    ylt, tri_s1
+    move    swp, p1                    // swp is dead at tri_s1
     move    p1, p2
-    move    p2, $t4
-    move    $t4, $t0
-    move    $t0, $t1
-    move    $t1, $t4
+    move    p2, swp
+    move    swp, py1
+    move    py1, py2
+    move    py2, swp
 tri_s1:
-    slt     $t3, $t2, $t1
-    beqz    $t3, tri_s2
-    move    $t4, p2                    // $t4 is dead at tri_s2
+    slt     ylt, py3, py2
+    beqz    ylt, tri_s2
+    move    swp, p2                    // swp is dead at tri_s2
     move    p2, p3
-    move    p3, $t4
-    move    $t4, $t1
-    move    $t1, $t2
-    move    $t2, $t4
+    move    p3, swp
+    move    swp, py2
+    move    py2, py3
+    move    py3, swp
 tri_s2:
-    slt     $t3, $t1, $t0
-    beqz    $t3, tri_s3
-    move    $t4, p1                    // $t4 is dead at tri_s3
+    slt     ylt, py2, py1
+    beqz    ylt, tri_s3
+    move    swp, p1                    // swp is dead at tri_s3
     move    p1, p2
-    move    p2, $t4
-    move    $t4, $t0
-    move    $t0, $t1
-    move    $t1, $t4
+    move    p2, swp
+    move    swp, py1
+    move    py1, py2
+    move    py2, swp
 tri_s3:
     // From here on the code is scheduled for SU/VU dual issue (tools/rsp_cycles.py): scalar
     // work that does not depend on the vector chain is interleaved to fill vector latencies.
@@ -1045,26 +1184,26 @@ tri_s3:
     vrcp    vrf[4], vhml[5]
     ssv     vnzf[0], 14(outptr)
     vrcph   vri[4], vhml[5]
-    lw      $t2, 12(outptr)             // NZ
+    lw      nzv, 12(outptr)             // NZ
     vmov    vxf[0], vhml[1]             // reciprocal inputs
     sra     $t6, $t4, 2
     vmov    vxf[2], vhml[3]
     andi    $t4, $t4, 3
     vmov    vxf[4], vhml[5]
-    sra     $t1, $t2, 31
+    sra     $t1, nzv, 31
     sll     $t4, $t4, 14
     mtc2    $t6, vfy[4]
     mtc2    $t4, vfy[6]
     veq     vjunk, vxf, vzero           // horizontal edge (HY = 0): slope 0
-    beqz    $t2, tri_done               // degenerate
-    slt     lft, $zero, $t2             // NZ > 0
+    beqz    nzv, tri_done               // degenerate
+    slt     lft, $zero, nzv             // NZ > 0
     // NZ normalized to NZ' = NZ >> k with |NZ'| < 2^16: 2^31/NZ' then keeps 15-16 significant
     // bits whatever the size (guard-band triangles reach NZ ~ 2^24, where 2^31/NZ has 7).
-    // The attribute numerators are shifted by k too (x 0x10000>>k, k stays in $t6): their
+    // The attribute numerators are shifted by k too (x 0x10000>>k, k stays in nzk): their
     // truncation costs ~1/|NZ'| of a step per pixel, below the s15.16 lsb.
-    xor     $t1, $t2, $t1               // ~NZ when negative: same bit length as |NZ| - 1
+    xor     $t1, nzv, $t1               // ~NZ when negative: same bit length as |NZ| - 1
     vmrg    vsx, vzero, vhml
-    lw      $t9, GEOMMODE($zero)        // op << 24 | level << 19 | tile << 16
+    lw      gmode, GEOMMODE($zero)      // op << 24 | level << 19 | tile << 16
     vaddc   vtf, vxf, vxf               // -2x for the Newton-Raphson step (lane 7 in tri_nz)
     sra     $t6, $t3, 2
     vadd    vti, vxi, vxi
@@ -1078,12 +1217,12 @@ tri_s3:
     vsub    vti, vzero, vti
     sh      $t3, 10(outptr)
     bnez    $t5, tri_nz_k               // |NZ| >= 2^16 (rare: over ~2048 pixels)
-    li      $t6, 0                      // k
-tri_nz:                                 // $t2 = NZ' (k = 0 falls through, tri_nz_k jumps here)
-    sra     $t1, $t2, 16
+    li      nzk, 0                      // k
+tri_nz:                                 // nzv = NZ' (k = 0 falls through, tri_nz_k jumps here)
+    sra     $t1, nzv, 16
     mtc2    $t1, vxi[14]                // NZ' in lane 7 of the reciprocal inputs
-    mtc2    $t2, vxf[14]
-    sll     $t7, $t2, 1
+    mtc2    nzv, vxf[14]
+    sll     $t7, nzv, 1
     subu    $t7, $zero, $t7
     sra     $t5, $t7, 16
     vrcph   vri[7], vxi[7]
@@ -1091,7 +1230,7 @@ tri_nz:                                 // $t2 = NZ' (k = 0 falls through, tri_n
     vrcpl   vrf[7], vxf[7]
     mtc2    $t5, vti[14]
     vrcph   vri[7], vzero[0]
-    srl     $t0, $t9, 16                // command header
+    srl     $t0, gmode, 16              // command header
     sll     $t1, lft, 7
     or      $t0, $t0, $t1
 
@@ -1099,50 +1238,50 @@ tri_nz:                                 // $t2 = NZ' (k = 0 falls through, tri_n
     vmudl   vjunk, vtf, vrf
     sh      $t0, 0(outptr)              // (before the loads: no store two cycles after one)
     vmadm   vjunk, vti, vrf
-    lh      $t2, 0x06(p2)               // W of the three vertices (s15.16), for the attributes
+    lh      wv2, 0x06(p2)               // W of the three vertices (s15.16), for the attributes
     vmadn   vtf, vtf, vri
     lhu     $t4, 0x0E(p2)
     vmadh   vti, vti, vri
-    lh      $t3, 0x06(p3)
+    lh      wv3, 0x06(p3)
     vmudn   vjunk, vrf, vconst[2]       // r0 * (2 + t) = 2 * r0 + r0 * t
     lhu     $t5, 0x0E(p3)
     vmadh   vjunk, vri, vconst[2]
-    lh      $t0, 0x06(p1)
+    lh      minw, 0x06(p1)
     vmadl   vjunk, vrf, vtf
     lhu     $t1, 0x0E(p1)
     vmadm   vjunk, vri, vtf
-    sll     $t2, $t2, 16
+    sll     wv2, wv2, 16
     vmadn   vrf, vrf, vti
-    or      $t2, $t2, $t4
+    or      wv2, wv2, $t4
     vmadh   vri, vri, vti
     lsv     $v7[0], 0x16(p1)            // vinvi: 1/w of the vertices (s15.16), for the attributes
-    addiu   $t8, outptr, 32             // (both in the wait for vrf / vri)
-    sll     $t3, $t3, 16
+    addiu   tend, outptr, 32            // (both in the wait for vrf / vri)
+    sll     wv3, wv3, 16
 
     // slopes = (HX, MX, LX) / (HY, MY, LY) in s15.16 (0 for a horizontal edge); the product
     // is accumulated twice to undo the half-scale reciprocal
     vmudn   vjunk, vrf, vsx
-    or      $t3, $t3, $t5
+    or      wv3, wv3, $t5
     vmadh   vjunk, vri, vsx
-    sll     $t0, $t0, 16
+    sll     minw, minw, 16
     vmadn   vjunk, vrf, vsx
-    or      $t0, $t0, $t1
+    or      minw, minw, $t1
     vmadh   vjunk, vri, vsx
-    srl     $t9, $t9, 24
+    srl     gmode, gmode, 24
     vsar    vslf, vjunk, vjunk[1]
     vsar    vsli, vjunk, vjunk[0]
-    andi    $t9, $t9, 7                 // K64_TRI_* flags
+    andi    gmode, gmode, 7             // K64_TRI_* flags
     // XH, XM = X1 + slope * FY, X1 accumulated first (in the slope latency). The scalar side
     // starts the smallest W for the attributes, branch-free (W > 0, so W2 - W1 cannot
     // overflow): t0 = min(W1, W2).
     vmudn   vjunk, vedf, vconst[1]
-    subu    $t5, $t2, $t0
+    subu    $t5, wv2, minw
     vmadh   vjunk, vedi, vconst[1]
     sra     $t4, $t5, 31
     vmadl   vjunk, vslf, vfy[1]
     and     $t5, $t5, $t4
     vmadm   vjunk, vsli, vfy[1]
-    addu    $t0, $t0, $t5
+    addu    minw, minw, $t5
     vmadn   vedf, vslf, vfy[0]
     ssv     vsli[8], 12(outptr)         // ISL
     vmadh   vedi, vsli, vfy[0]
@@ -1161,8 +1300,8 @@ tri_nz:                                 // $t2 = NZ' (k = 0 falls through, tri_n
     ssv     vedf[0], 18(outptr)
     ssv     vedi[4], 24(outptr)         // XM
     ssv     vedf[4], 26(outptr)
-    beqz    $t9, tri_emit
-    subu    $t5, $t3, $t0
+    beqz    gmode, tri_emit
+    subu    $t5, wv3, minw
 
     // ---- attributes ----
     .def vw     $v5             // smallest W: lane 0 int, 1 frac
@@ -1180,14 +1319,14 @@ tri_w2:
     vxor    vt1, vzero, vzero           // s, t land in lanes 4, 5: the s/w, t/w fractions
     and     $t5, $t5, $t4               // must come out 0 in the other lanes
     vxor    vt2, vzero, vzero
-    addu    $t0, $t0, $t5
+    addu    minw, minw, $t5
     vxor    vt3, vzero, vzero
     lsv     vinvi[2], 0x16(p2)
-    addiu   $t0, $t0, -1                // (minW - lsb) / 2: every 1/w * that is < 0.5, i.e.
-    srl     $t0, $t0, 1                 // directly 0.15 below 1.0 (no clamp, no shift)
-    srl     $t1, $t0, 16
+    addiu   minw, minw, -1              // (minW - lsb) / 2: every 1/w * that is < 0.5, i.e.
+    srl     minw, minw, 1               // directly 0.15 below 1.0 (no clamp, no shift)
+    srl     $t1, minw, 16
     mtc2    $t1, vw[0]
-    mtc2    $t0, vw[2]
+    mtc2    minw, vw[2]
     lsv     vinvi[4], 0x16(p3)
     lsv     vinvf[0], 0x18(p1)
     lsv     vinvf[2], 0x18(p2)
@@ -1249,22 +1388,22 @@ tri_w2:
     // DY = HA*MX - MA*HX = A1*(HX - MX) + A3*MX - A2*HX with HX - MX = LX: no A2 - A1,
     // A3 - A1 differences (nor their latency, nor their saturation).
     vmudn   vjunk, vf1, vneg[5]         // the s/w, t/w fractions (accumulator bit 0) first:
-    lbu     $t0, TRIOFS($zero)          // block addresses: shade $t0, texture $t1, z $t2
+    lbu     blksh, TRIOFS($zero)        // block addresses: shade, texture, z
     vmadn   vjunk, vf2, vhml[1]         // va3 is written last
-    lbu     $t1, TRIOFS+1($zero)
+    lbu     blktx, TRIOFS+1($zero)
     vmadn   vjunk, vf3, vneg[3]
-    lbu     $t2, TRIOFS+2($zero)
+    lbu     blkz, TRIOFS+2($zero)
     vmadh   vjunk, va1, vneg[5]
     vmadh   vjunk, va2, vhml[1]
     vmadh   vjunk, va3, vneg[3]
     vsar    vdxf, vjunk, vjunk[1]
     lbu     $t3, TRISIZE($zero)
     vsar    vdxi, vjunk, vjunk[0]
-    addu    $t0, $t0, outptr
+    addu    blksh, blksh, outptr
     vmudh   vjunk, va1, vhml[4]
-    addu    $t1, $t1, outptr
+    addu    blktx, blktx, outptr
     vmadh   vjunk, va3, vhml[2]
-    addu    $t2, $t2, outptr
+    addu    blkz, blkz, outptr
     vmadh   vjunk, va2, vneg[0]
     addu    outptr, outptr, $t3
     vmadn   vjunk, vf1, vhml[4]
@@ -1272,7 +1411,7 @@ tri_w2:
     vmadn   vjunk, vf2, vneg[0]
     vsar    vdyf, vjunk, vjunk[1]
     vsar    vdyi, vjunk, vjunk[0]
-    beqz    $t6, tri_nok
+    beqz    nzk, tri_nok
     vmudl   vjunk, vdxf, vfy[4]         // DX, DY >> k (see the NZ normalization); tri_nok
                                         // starts a new accumulator chain
     vmadm   vjunk, vdxi, vfy[4]
@@ -1292,43 +1431,43 @@ tri_nok:
     vmudl   vjunk, vdyf, vrf[7]
     vmadm   vjunk, vdyi, vrf[7]
     vmadn   vdyf, vdyf, vri[7]
-    sdv     vdxf[0], 0x18($t0)
+    sdv     vdxf[0], 0x18(blksh)
     vmadh   vdyi, vdyi, vri[7]
-    sdv     vdxi[0], 0x08($t0)
+    sdv     vdxi[0], 0x08(blksh)
     vmadl   vjunk, vdxf, vslf[0]        // DE = DY + DX * ISH (accumulator still holds DY)
-    sdv     vdxf[8], 0x18($t1)
+    sdv     vdxf[8], 0x18(blktx)
     vmadm   vjunk, vdxi, vslf[0]
-    sdv     vdxi[8], 0x08($t1)
+    sdv     vdxi[8], 0x08(blktx)
     vmadn   vdef, vdxf, vsli[0]
-    ssv     vdxf[14], 0x06($t2)
+    ssv     vdxf[14], 0x06(blkz)
     vmadh   vdei, vdxi, vsli[0]
-    ssv     vdxi[14], 0x04($t2)
+    ssv     vdxi[14], 0x04(blkz)
     vmudh   vjunk, va1, vconst[1]       // base = A1 + DE * FY
     vmadn   vjunk, vf1, vconst[1]
-    sdv     vdyf[0], 0x38($t0)
+    sdv     vdyf[0], 0x38(blksh)
     vmadl   vjunk, vdef, vfy[1]
-    sdv     vdyi[0], 0x28($t0)
+    sdv     vdyi[0], 0x28(blksh)
     vmadm   vjunk, vdei, vfy[1]
-    sdv     vdyf[8], 0x38($t1)
+    sdv     vdyf[8], 0x38(blktx)
     vmadn   vfinf, vdef, vfy[0]
-    sdv     vdyi[8], 0x28($t1)
+    sdv     vdyi[8], 0x28(blktx)
     vmadh   vfini, vdei, vfy[0]
-    ssv     vdyf[14], 0x0E($t2)
-    ssv     vdyi[14], 0x0C($t2)
+    ssv     vdyf[14], 0x0E(blkz)
+    ssv     vdyi[14], 0x0C(blkz)
     addiu   ntri, ntri, 1
-    sdv     vdef[0], 0x30($t0)
-    sdv     vdei[0], 0x20($t0)
-    sdv     vdef[8], 0x30($t1)
-    sdv     vdei[8], 0x20($t1)
-    ssv     vdef[14], 0x0A($t2)
-    ssv     vdei[14], 0x08($t2)
-    sdv     vfinf[0], 0x10($t0)
-    sdv     vfini[0], 0x00($t0)
-    sdv     vfinf[8], 0x10($t1)
-    sdv     vfini[8], 0x00($t1)
-    ssv     vfinf[14], 0x02($t2)
-    jr      $s7
-    ssv     vfini[14], 0x00($t2)
+    sdv     vdef[0], 0x30(blksh)
+    sdv     vdei[0], 0x20(blksh)
+    sdv     vdef[8], 0x30(blktx)
+    sdv     vdei[8], 0x20(blktx)
+    ssv     vdef[14], 0x0A(blkz)
+    ssv     vdei[14], 0x08(blkz)
+    sdv     vfinf[0], 0x10(blksh)
+    sdv     vfini[0], 0x00(blksh)
+    sdv     vfinf[8], 0x10(blktx)
+    sdv     vfini[8], 0x00(blktx)
+    ssv     vfinf[14], 0x02(blkz)
+    jr      tret
+    ssv     vfini[14], 0x00(blkz)
     .undef vdxi
     .undef vdxf
     .undef vdyi
@@ -1341,11 +1480,11 @@ tri_nok:
     .undef vf2
     .undef vf3
 tri_emit:
-    move    outptr, $t8
-    jr      $s7
+    move    outptr, tend
+    jr      tret
     addiu   ntri, ntri, 1
 tri_done:
-    jr      $s7
+    jr      tret
     nop
 
 // Out of line: tri_go (clip fan) and the OUTBUF flush enter the buffer test and the cull here.
@@ -1354,8 +1493,8 @@ tri_flush:
     nop
     j       tri_room
     nop
-tri_check:                              // $t5 = OUTLIMIT
-    sltu    $t0, $t5, outptr
+tri_check:                              // olim = OUTLIMIT
+    sltu    $t0, olim, outptr
     beqz    $t0, tri_room_nz
     mfc2    $t3, vnzi[0]
     jal     flush_out
@@ -1365,37 +1504,37 @@ tri_room:
     // mfc2 latency.
     mfc2    $t3, vnzi[0]
 tri_room_nz:
-    lw      $t7, CULLMODE($zero)
-    lh      $t0, 0x12(p1)
-    lh      $t1, 0x12(p2)
+    lw      cullm, CULLMODE($zero)
+    lh      py1, 0x12(p1)
+    lh      py2, 0x12(p2)
     sra     $t3, $t3, 31
-    lh      $t2, 0x12(p3)
-    sllv    $t4, $t7, $t3
+    lh      py3, 0x12(p3)
+    sllv    $t4, cullm, $t3
     bltz    $t4, tri_done
-    slt     $t3, $t1, $t0
+    slt     ylt, py2, py1
     j       tri_sort
     nop
 
 tri_nz_k:                               // k = bit length of |NZ| >> 16 (<= 15), branch-free
     srl     $t1, $t5, 8
     sltu    $t1, $zero, $t1
-    sll     $t6, $t1, 3                 // 8 if >= 0x100
-    srlv    $t5, $t5, $t6
+    sll     nzk, $t1, 3                 // 8 if >= 0x100
+    srlv    $t5, $t5, nzk
     srl     $t1, $t5, 4
     sltu    $t1, $zero, $t1
     sll     $t1, $t1, 2                 // 4 if >= 0x10
     srlv    $t5, $t5, $t1
     lbu     $t5, NZLUT($t5)             // bit length of 0..15
-    addu    $t6, $t6, $t1
-    addu    $t6, $t6, $t5
+    addu    nzk, nzk, $t1
+    addu    nzk, nzk, $t5
     li      $t5, 0x10000
-    srlv    $t5, $t5, $t6
+    srlv    $t5, $t5, nzk
     mtc2    $t5, vfy[8]                 // lane 4: numerator scale (only read when k != 0)
     j       tri_nz
-    srav    $t2, $t2, $t6
+    srav    nzv, nzv, nzk
 
 // ---- clipping --------------------------------------------------------------------------------
-// Entered from tri with $t4 = the planes the triangle crosses, $s7 = return address.
+// Entered from tri with $t4 = the planes the triangle crosses (clipor), $s7 = return address (tret).
 // Sutherland-Hodgman in clip space (s15.16) against those planes, in CLIP_PLANE_TABLE order;
 // new vertices go to scratch cache entries 32..43 (over INBUF, dead after VTX) and are
 // projected like vtx_loop does. The polygon is then drawn as a fan (v0, vi, vi+1) through
@@ -1403,116 +1542,157 @@ tri_nz_k:                               // k = bit length of |NZ| >> 16 (<= 15),
 // Plane distances are exact 32-bit (clip coordinates must keep |W| + |C| < 32768); a new
 // vertex is always interpolated from the inside vertex towards the outside one, so an edge
 // shared by two triangles is cut at the same point in both.
-// Kept across the fan: k0 list, k1 count, gp index, fp return, s4 (cmd_tri's second triangle).
+// Kept across the fan: clist, ccount, fanidx, cret, tri2 (cmd_tri's second triangle).
+    .undef cullm
+    .undef olim
+    .undef fl1
+    .undef fl2
+    .undef fl3
+    .undef clipor
+    .undef py1
+    .undef py2
+    .undef py3
+    .undef ylt
+    .undef swp
+    .undef gmode
+    .undef tend
+    .undef nzv
+    .undef nzk
+    .undef wv2
+    .undef wv3
+    .undef minw
+    .undef blksh
+    .undef blktx
+    .undef blkz
+    .def cret    $fp            // return address of the whole clip (tret on entry)
+    .def cplanes $s5            // planes the triangle crosses (clipor)
+    .def clist   $k0            // current vertex list (CLIP_LISTS, ping-pong by ^ 0x10)
+    .def ccount  $k1            // vertices in it
+    .def cpool   $gp            // next scratch cache entry (reference = address / 8)
+    .def fanidx  $gp            // fan: index of vi
+    .def cplane  $s6            // CLIP_PLANE_TABLE entry: mask, coordinate offset, mode
+    .def ccoord  $a0            // byte offset of the plane's coordinate (x 0, y 2, z 4)
+    .def cmode   $s7            // 1 = W - C, 2 = 4W (guard band)
+    .def olist   $t9            // output list, its count
+    .def ocount  $t8
+    .def prevv   $a2            // previous vertex of the edge, its distance
+    .def prevd   $a3
+    .def eidx    $a1            // edge index in the current list
+    .def curv    $t6            // current vertex, its distance
+    .def curd    $t7
+    .def dnum    $t2            // clip_isect division: d_in, d_in - d_out, bits left, t
+    .def dden    $t3
+    .def dcnt    $t4
+    .def dquot   $t5
     .overlay clip, OVL_SLOT
 tri_clip:
-    move    $fp, $s7
-    move    $s5, $t4
-    li      $k0, CLIP_LISTS
+    move    cret, tret
+    move    cplanes, $t4
+    li      clist, CLIP_LISTS
     srl     $t0, w0, 16
-    sb      $t0, 0($k0)
+    sb      $t0, 0(clist)
     srl     $t0, w0, 8
-    sb      $t0, 1($k0)
-    sb      w0, 2($k0)
-    li      $k1, 3                      // vertices in the current list
-    li      $gp, VREF_BASE + VCACHE_COUNT * 5   // next scratch entry (references: address / 8)
-    li      $s6, CLIP_PLANE_TABLE
+    sb      $t0, 1(clist)
+    sb      w0, 2(clist)
+    li      ccount, 3                   // vertices in the current list
+    li      cpool, VREF_BASE + VCACHE_COUNT * 5 // next scratch entry (references: address / 8)
+    li      cplane, CLIP_PLANE_TABLE
 clip_plane:
-    lhu     $t0, 0($s6)
-    and     $t0, $t0, $s5
+    lhu     $t0, 0(cplane)
+    and     $t0, $t0, cplanes
     beqz    $t0, clip_plane_next
     nop
-    lbu     $a0, 2($s6)                 // byte offset of the coordinate (x 0, y 2, z 4)
-    lbu     $s7, 3($s6)                 // mode: 1 = W - C, 2 = 4W
-    xori    $t9, $k0, 0x10              // output list
-    li      $t8, 0                      // output count
-    addu    $t0, $k0, $k1
-    lbu     $a2, -1($t0)                // previous vertex = the last one
+    lbu     ccoord, 2(cplane)           // byte offset of the coordinate (x 0, y 2, z 4)
+    lbu     cmode, 3(cplane)            // mode: 1 = W - C, 2 = 4W
+    xori    olist, clist, 0x10          // output list
+    li      ocount, 0                   // output count
+    addu    $t0, clist, ccount
+    lbu     prevv, -1($t0)              // previous vertex = the last one
     jal     clip_dist
-    move    $t0, $a2
-    move    $a3, $t1                    // its distance
-    li      $a1, 0
+    move    $t0, prevv
+    move    prevd, $t1                  // its distance
+    li      eidx, 0
 clip_edge:
-    addu    $t0, $k0, $a1
-    lbu     $t6, 0($t0)                 // current vertex
+    addu    $t0, clist, eidx
+    lbu     curv, 0($t0)                // current vertex
     jal     clip_dist
-    move    $t0, $t6
-    move    $t7, $t1
-    slt     $t2, $a3, $zero             // previous outside
-    slt     $t3, $t7, $zero             // current outside
+    move    $t0, curv
+    move    curd, $t1
+    slt     $t2, prevd, $zero           // previous outside
+    slt     $t3, curd, $zero            // current outside
     beq     $t2, $t3, clip_keep
     nop
     bnez    $t2, clip_enter
     nop
-    move    $t0, $a2                    // leaving: inside = previous
-    move    $t1, $t6
-    move    $t2, $a3
+    move    $t0, prevv                  // leaving: inside = previous
+    move    $t1, curv
+    move    $t2, prevd
     jal     clip_isect
-    move    $t3, $t7
+    move    $t3, curd
     j       clip_keep
     nop
 clip_enter:
-    move    $t0, $t6                    // entering: inside = current
-    move    $t1, $a2
-    move    $t2, $t7
+    move    $t0, curv                   // entering: inside = current
+    move    $t1, prevv
+    move    $t2, curd
     jal     clip_isect
-    move    $t3, $a3
+    move    $t3, prevd
 clip_keep:
-    bltz    $t7, clip_edge_next
-    addu    $t0, $t9, $t8
-    sb      $t6, 0($t0)
-    addiu   $t8, $t8, 1
+    bltz    curd, clip_edge_next
+    addu    $t0, olist, ocount
+    sb      curv, 0($t0)
+    addiu   ocount, ocount, 1
 clip_edge_next:
-    move    $a2, $t6
-    move    $a3, $t7
-    addiu   $a1, $a1, 1
-    bne     $a1, $k1, clip_edge
+    move    prevv, curv
+    move    prevd, curd
+    addiu   eidx, eidx, 1
+    bne     eidx, ccount, clip_edge
     nop
-    move    $k0, $t9
-    move    $k1, $t8
-    sltiu   $t0, $k1, 3
+    move    clist, olist
+    move    ccount, ocount
+    sltiu   $t0, ccount, 3
     bnez    $t0, clip_out               // nothing left
     nop
 clip_plane_next:
-    addiu   $s6, $s6, 4
+    addiu   cplane, cplane, 4
     li      $t0, CLIP_PLANE_TABLE + 24
-    bne     $s6, $t0, clip_plane
+    bne     cplane, $t0, clip_plane
     nop
 
-    li      $gp, 1
+    li      fanidx, 1
 clip_fan:
-    lbu     $t0, 0($k0)
-    addu    $t1, $k0, $gp
+    lbu     $t0, 0(clist)
+    addu    $t1, clist, fanidx
     lbu     $t2, 0($t1)
     lbu     $t3, 1($t1)
     sll     p1, $t0, 3
     sll     p2, $t2, 3
     jal     tri_sub
     sll     p3, $t3, 3
-    addiu   $gp, $gp, 1
-    addiu   $t0, $k1, -1
-    bne     $gp, $t0, clip_fan
+    addiu   fanidx, fanidx, 1
+    addiu   $t0, ccount, -1
+    bne     fanidx, $t0, clip_fan
     nop
 clip_out:
-    jr      $fp
+    jr      cret
     nop
 
 tri_sub:
     j       tri_go
-    move    $s7, $ra
+    move    tret, $ra
 
 // $t0 = vertex reference -> $t1 = plane distance, s15.16: W +- C, or W +- C/4 for the guard
 // band (the 4W plane scaled by 1/4: same crossing point, no overflow). Clobbers t0, t2, t3.
 clip_dist:
     sll     $t0, $t0, 3
-    addu    $t2, $t0, $a0
+    addu    $t2, $t0, ccoord
     lh      $t1, 0x00($t2)              // C
     lhu     $t3, 0x08($t2)
     sll     $t1, $t1, 16
     or      $t1, $t1, $t3
-    andi    $t3, $s7, 2
+    andi    $t3, cmode, 2
     beqz    $t3, clip_dist_sign
-    andi    $t3, $s7, 1
+    andi    $t3, cmode, 1
     sra     $t1, $t1, 2
 clip_dist_sign:
     beqz    $t3, clip_dist_w
@@ -1529,7 +1709,7 @@ clip_dist_w:
 // $t0 = inside reference, $t1 = outside reference, $t2 = inside distance (>= 0), $t3 =
 // outside distance (< 0). Clobbers t0-t5 and v4-v13.
 clip_isect:
-    sltiu   $t4, $gp, VREF_BASE + (VCACHE_COUNT + CLIP_POOL_COUNT) * 5
+    sltiu   $t4, cpool, VREF_BASE + (VCACHE_COUNT + CLIP_POOL_COUNT) * 5
     beqz    $t4, clip_out               // pool exhausted (degenerate input): drop
     sll     $t0, $t0, 3
     sll     $t1, $t1, 3
@@ -1542,26 +1722,26 @@ clip_isect:
     luv     vin[0], 0x20($t1)
     llv     vin[8], 0x24($t1)
     // t = d_in / (d_in - d_out) in 0.16, restoring division (needs d_in - d_out < 2^31)
-    subu    $t3, $t2, $t3
-    bgez    $t3, clip_div_ok
-    li      $t4, 16
-    srl     $t3, $t3, 1
-    srl     $t2, $t2, 1
+    subu    dden, dnum, dden
+    bgez    dden, clip_div_ok
+    li      dcnt, 16
+    srl     dden, dden, 1
+    srl     dnum, dnum, 1
 clip_div_ok:
-    li      $t5, 0
+    li      dquot, 0
 clip_div:
-    sll     $t2, $t2, 1
-    sltu    $t0, $t2, $t3
+    sll     dnum, dnum, 1
+    sltu    $t0, dnum, dden
     xori    $t0, $t0, 1
-    sll     $t5, $t5, 1
-    or      $t5, $t5, $t0
+    sll     dquot, dquot, 1
+    or      dquot, dquot, $t0
     beqz    $t0, clip_div_next
-    addiu   $t4, $t4, -1
-    subu    $t2, $t2, $t3
+    addiu   dcnt, dcnt, -1
+    subu    dnum, dnum, dden
 clip_div_next:
-    bnez    $t4, clip_div
+    bnez    dcnt, clip_div
     nop
-    mtc2    $t5, vtmp[0]
+    mtc2    dquot, vtmp[0]
     // new = in + (out - in) * t: clip in 32 bits, attributes in 16 (S/T deltas must fit s16)
     vsubc   vnf, vnf, vcf
     vsub    vni, vni, vci
@@ -1573,16 +1753,16 @@ clip_div_next:
     vmadn   vcf, vzero, vzero[0]
     vmudm   vin, vin, vtmp[0]
     vadd    vattr, vattr, vin
-    sll     $t0, $gp, 3
+    sll     $t0, cpool, 3
     sdv     vci[0], 0x00($t0)
     sdv     vcf[0], 0x08($t0)
     suv     vattr[0], 0x20($t0)
     slv     vattr[8], 0x24($t0)
     sh      $zero, 0x1A($t0)
-    addu    $t1, $t9, $t8
-    sb      $gp, 0($t1)
-    addiu   $t8, $t8, 1
-    addiu   $gp, $gp, 5
+    addu    $t1, olist, ocount
+    sb      cpool, 0($t1)
+    addiu   ocount, ocount, 1
+    addiu   cpool, cpool, 5
     mfc2    $t1, vci[6]                 // W <= 0 cannot be projected (degenerate): drop
     mfc2    $t2, vcf[6]
     bltz    $t1, clip_out
@@ -1620,10 +1800,33 @@ clip_div_next:
     sdv     vscr[0], 0x10($t0)
     jr      $ra
     ssv     vrcf[6], 0x18($t0)
+    .undef cret
+    .undef cplanes
+    .undef clist
+    .undef ccount
+    .undef cpool
+    .undef fanidx
+    .undef cplane
+    .undef ccoord
+    .undef cmode
+    .undef olist
+    .undef ocount
+    .undef prevv
+    .undef prevd
+    .undef eidx
+    .undef curv
+    .undef curd
+    .undef dnum
+    .undef dden
+    .undef dcnt
+    .undef dquot
 // GEOMMODE (entered through cmd_geommode_ovl).
+    .def gtri   $t0             // K64_TRI_* blocks: 4 shade, 2 texture, 1 z
+    .def gpass  $t4             // LIGHTMODE: first VTX pass << 16 | its return
+    .def gofs   $t3             // TRISIZE, then the next free block offset (TRIOFS)
 cmd_geommode:
-    andi    $t0, w1, 7
-    ori     $t1, $t0, 0x08
+    andi    gtri, w1, 7
+    ori     $t1, gtri, 0x08
     sll     $t1, $t1, 24
     andi    $t2, w0, 0x3F               // tile 2..0, mip levels 5..3 (RDP bits 21..16)
     sll     $t2, $t2, 16
@@ -1635,53 +1838,56 @@ cmd_geommode:
     or      $t2, $t2, $t3
     sw      $t2, CULLMODE($zero)
     andi    $t2, w1, 0xC00              // VTX passes: lighting 0x400, texgen 0x800
-    lui     $t4, vtx_loop               // (lui/ori: the labels are forward references)
+    lui     gpass, vtx_loop             // (lui/ori: the labels are forward references)
     beqz    $t2, gm_pass
     li      $t5, 0x400
-    lui     $t4, light_verts
+    lui     gpass, light_verts
     beq     $t2, $t5, gm_pass
-    ori     $t4, $t4, vtx_loop
+    ori     gpass, gpass, vtx_loop
     li      $t5, 0x800
-    lui     $t4, texgen_verts
+    lui     gpass, texgen_verts
     beq     $t2, $t5, gm_pass
-    ori     $t4, $t4, vtx_loop
-    lui     $t4, light_verts
-    ori     $t4, $t4, vtx_texgen
+    ori     gpass, gpass, vtx_loop
+    lui     gpass, light_verts
+    ori     gpass, gpass, vtx_texgen
 gm_pass:
-    sw      $t4, LIGHTMODE($zero)
-    li      $t3, 32                     // size = 32 + 64 shade + 64 tex + 16 z
-    andi    $t2, $t0, 4
+    sw      gpass, LIGHTMODE($zero)
+    li      gofs, 32                    // size = 32 + 64 shade + 64 tex + 16 z
+    andi    $t2, gtri, 4
     sll     $t2, $t2, 4
-    addu    $t3, $t3, $t2
-    andi    $t2, $t0, 2
+    addu    gofs, gofs, $t2
+    andi    $t2, gtri, 2
     sll     $t2, $t2, 5
-    addu    $t3, $t3, $t2
-    andi    $t2, $t0, 1
+    addu    gofs, gofs, $t2
+    andi    $t2, gtri, 1
     sll     $t2, $t2, 4
-    addu    $t3, $t3, $t2
-    sb      $t3, TRISIZE($zero)
-    andi    $t1, $t0, 4                 // TRIOFS: enabled blocks packed from 32, disabled
+    addu    gofs, gofs, $t2
+    sb      gofs, TRISIZE($zero)
+    andi    $t1, gtri, 4                // TRIOFS: enabled blocks packed from 32, disabled
     li      $t2, 112                    // ones at 112 (shade, texture) / 160 (z)
     beqz    $t1, gm_ofs_s
-    li      $t3, 32
-    move    $t2, $t3
-    addiu   $t3, $t3, 64
+    li      gofs, 32
+    move    $t2, gofs
+    addiu   gofs, gofs, 64
 gm_ofs_s:
     sb      $t2, TRIOFS($zero)
-    andi    $t1, $t0, 2
+    andi    $t1, gtri, 2
     beqz    $t1, gm_ofs_t
     li      $t2, 112
-    move    $t2, $t3
-    addiu   $t3, $t3, 64
+    move    $t2, gofs
+    addiu   gofs, gofs, 64
 gm_ofs_t:
     sb      $t2, TRIOFS+1($zero)
-    andi    $t1, $t0, 1
+    andi    $t1, gtri, 1
     bnez    $t1, gm_ofs_z
     nop
-    li      $t3, 160
+    li      gofs, 160
 gm_ofs_z:
     j       cmd_next
-    sb      $t3, TRIOFS+2($zero)
+    sb      gofs, TRIOFS+2($zero)
+    .undef gtri
+    .undef gpass
+    .undef gofs
     .balign 8
 OVL_CLIP_END:
     .text
@@ -1724,10 +1930,25 @@ OVL_CLIP_END:
     .def avD    $v10                // per-frame volume step L R L R ... (RAMP), else 0
     .def avD4   $v11                // 4 * avD
     .def avVn   $v12                // volume of the next group
+    .def arec   $s4             // next record chunk in RDRAM
+    .def aptr   $s5             // record read pointer in SEGBUF
+    .def amask  $t7             // -2: even byte offset of a sample pair
+    .def astep  $gp             // 16.16 step (BLOCK: the block's RDRAM address)
+    .def afrac  $t1             // 16.16 start fraction
+    .def ablen  $t1             // BLOCK: frames, then bytes
+    .def astart $t2             // first frame of the segment in the block
+    .def alast  $t3             // frames - 1
+    .def ahdr   $t0             // dma8 << 24 | source, or 0 BLOCK, 1 END, 3 RAMP
+    .def asrc   $k0             // DMEM address of sample 0
+    .def apos   $k1             // position of the next lane (16.16, relative to asrc)
+    .def aphase $t4             // start & 3
+    .def alastf $t6             // last frame of the segment, then its group
+    .def agrp   $t8             // groups left - 1
+    .def aout   $fp             // OUTB group
     .overlay audio, OVL_SLOT
 audio_main:
-    move    $s4, w1                     // next record chunk in RDRAM
-    li      $s5, SEGBUF + SEGBUF_SIZE   // read pointer = end: fetch first
+    move    arec, w1                    // next record chunk in RDRAM
+    li      aptr, SEGBUF + SEGBUF_SIZE  // read pointer = end: fetch first
     vor     avOne, vzero, vconst[1]
     vor     avOnes, vzero, vconst[7]
     vxor    avD, avD, avD
@@ -1741,80 +1962,80 @@ audio_main:
     li      $t0, AUDTMP
     lqv     avLane[0], 16($t0)
     jal     aud_clear
-    li      $t7, -2
+    li      amask, -2
 
 aud_next:
     li      $t0, SEGBUF + SEGBUF_SIZE
-    bne     $s5, $t0, aud_have
+    bne     aptr, $t0, aud_have
     li      dmem, SEGBUF
-    move    dram, $s4
+    move    dram, arec
     jal     dma_read
     li      dlen, SEGBUF_SIZE - 1
-    addiu   $s4, $s4, SEGBUF_SIZE
-    li      $s5, SEGBUF
+    addiu   arec, arec, SEGBUF_SIZE
+    li      aptr, SEGBUF
 aud_have:
-    lw      $t0, 0($s5)                 // dma8 << 24 | source, or 0 = BLOCK, 1 = END
-    lw      $gp, 4($s5)                 // step (BLOCK: RDRAM address of the block)
-    lhu     $t1, 8($s5)                 // frac (BLOCK: frames)
-    lbu     $t2, 10($s5)                // start
-    lbu     $t3, 11($s5)                // count - 1
-    sltiu   $t4, $t0, 4                 // 0 BLOCK, 1 END, 3 RAMP
+    lw      ahdr, 0(aptr)               // dma8 << 24 | source, or 0 = BLOCK, 1 = END
+    lw      astep, 4(aptr)              // step (BLOCK: RDRAM address of the block)
+    lhu     afrac, 8(aptr)              // frac (BLOCK: frames)
+    lbu     astart, 10(aptr)            // start
+    lbu     alast, 11(aptr)             // count - 1
+    sltiu   $t4, ahdr, 4                // 0 BLOCK, 1 END, 3 RAMP
     bnez    $t4, aud_ctl
-    addiu   $s5, $s5, 16
-    llv     avVol[0], -4($s5)
-    llv     avVol[4], -4($s5)
-    llv     avVol[8], -4($s5)
-    llv     avVol[12], -4($s5)
+    addiu   aptr, aptr, 16
+    llv     avVol[0], -4(aptr)
+    llv     avVol[4], -4(aptr)
+    llv     avVol[8], -4(aptr)
+    llv     avVol[12], -4(aptr)
     // source: DMA from the 8-byte aligned address below it
-    srl     dlen, $t0, 24
+    srl     dlen, ahdr, 24
     sll     dlen, dlen, 3
     addiu   dlen, dlen, 7
     lui     $t4, 0x00FF
     ori     $t4, $t4, 0xFFF8
-    and     dram, $t0, $t4
-    andi    $k0, $t0, 7
+    and     dram, ahdr, $t4
+    andi    asrc, ahdr, 7
     jal     dma_read                    // clobbers t0
     li      dmem, SRCBUF
-    addiu   $k0, $k0, SRCBUF            // sample 0 of the segment
+    addiu   asrc, asrc, SRCBUF          // sample 0 of the segment
     // position of the first lane of the start group: frac - (start & 3) * step
-    andi    $t4, $t2, 3
-    move    $k1, $t1
-    beqz    $t4, aud_pos_ok
-    move    $t5, $t4
+    andi    aphase, astart, 3
+    move    apos, afrac
+    beqz    aphase, aud_pos_ok
+    move    $t5, aphase
 aud_pos:
     addiu   $t5, $t5, -1
     bnez    $t5, aud_pos
-    subu    $k1, $k1, $gp
+    subu    apos, apos, astep
 aud_pos_ok:
-    sh      $k1, AUDTMP + 0($zero)
-    sh      $k1, AUDTMP + 2($zero)
-    addu    $t5, $k1, $gp
+    sh      apos, AUDTMP + 0($zero)
+    sh      apos, AUDTMP + 2($zero)
+    addu    $t5, apos, astep
     sh      $t5, AUDTMP + 4($zero)
     sh      $t5, AUDTMP + 6($zero)
-    addu    $t5, $t5, $gp
+    addu    $t5, $t5, astep
     sh      $t5, AUDTMP + 8($zero)
     sh      $t5, AUDTMP + 10($zero)
-    addu    $t5, $t5, $gp
+    addu    $t5, $t5, astep
     sh      $t5, AUDTMP + 12($zero)
     sh      $t5, AUDTMP + 14($zero)
     li      $t0, AUDTMP
     lqv     avF[0], 0($t0)
-    sll     $t5, $gp, 2
+    sll     $t5, astep, 2
     mtc2    $t5, avInc[0]
     // lane masks: first group lanes >= start & 3, last group lanes <= (start + count - 1) & 3
     ctc2    $zero, vco
-    mtc2    $t4, avK[0]
+    mtc2    aphase, avK[0]
     vge     avJ, avLane, avK[0]
     vmrg    avMask, avOnes, vzero
-    addu    $t6, $t2, $t3               // last frame
-    andi    $t5, $t6, 3
+    addu    alastf, astart, alast       // last frame
+    andi    $t5, alastf, 3
     addiu   $t5, $t5, 1
     mtc2    $t5, avK[0]
     vlt     avJ, avLane, avK[0]
     vmrg    avHi, avOnes, vzero
     // volume per lane: vol + (k - (start & 3)) * d, next group + 4 * d
     vsubc   avJ, vzero, vzero           // clear VCO for vsub/vadd
-    mtc2    $t4, avK[0]
+    mtc2    aphase, avK[0]
     li      $t5, 4
     mtc2    $t5, avK[2]
     vsub    avJ, avLane, avK[0]
@@ -1825,37 +2046,37 @@ aud_pos_ok:
     vadd    avVn, avVn, avVol
     vadd    avVol, avVol, avI
     vxor    avD, avD, avD               // the step applies to this record only
-    srl     $t6, $t6, 2
-    srl     $t5, $t2, 2
-    subu    $t8, $t6, $t5               // groups - 1
+    srl     alastf, alastf, 2
+    srl     $t5, astart, 2
+    subu    agrp, alastf, $t5           // groups - 1
     sll     $t5, $t5, 4
-    addiu   $fp, $t5, OUTB
+    addiu   aout, $t5, OUTB
 aud_group:
-    bnez    $t8, aud_gather
+    bnez    agrp, aud_gather
     nop
     vand    avMask, avMask, avHi
 aud_gather:
-    srl     $t0, $k1, 15
-    and     $t0, $t0, $t7
-    addu    $t0, $t0, $k0
+    srl     $t0, apos, 15
+    and     $t0, $t0, amask
+    addu    $t0, $t0, asrc
     llv     avA[0], 0($t0)
-    addu    $k1, $k1, $gp
-    srl     $t0, $k1, 15
-    and     $t0, $t0, $t7
-    addu    $t0, $t0, $k0
+    addu    apos, apos, astep
+    srl     $t0, apos, 15
+    and     $t0, $t0, amask
+    addu    $t0, $t0, asrc
     llv     avA[4], 0($t0)
-    addu    $k1, $k1, $gp
-    srl     $t0, $k1, 15
-    and     $t0, $t0, $t7
-    addu    $t0, $t0, $k0
+    addu    apos, apos, astep
+    srl     $t0, apos, 15
+    and     $t0, $t0, amask
+    addu    $t0, $t0, asrc
     llv     avA[8], 0($t0)
-    addu    $k1, $k1, $gp
-    srl     $t0, $k1, 15
-    and     $t0, $t0, $t7
-    addu    $t0, $t0, $k0
+    addu    apos, apos, astep
+    srl     $t0, apos, 15
+    and     $t0, $t0, amask
+    addu    $t0, $t0, asrc
     llv     avA[12], 0($t0)
-    addu    $k1, $k1, $gp
-    lqv     avO[0], 0($fp)
+    addu    apos, apos, astep
+    lqv     avO[0], 0(aout)
     // s0 * ~f + s1 * f + s0 = s0 * 65536 + (s1 - s0) * f
     vxor    avNF, avF, avOnes
     vmudn   avJ, avNF, avA[0q]
@@ -1870,27 +2091,27 @@ aud_gather:
     vor     avMask, avOnes, vzero
     vor     avVol, avVn, vzero
     vadd    avVn, avVn, avD4
-    sqv     avO[0], 0($fp)
-    addiu   $fp, $fp, 16
-    bnez    $t8, aud_group
-    addiu   $t8, $t8, -1
+    sqv     avO[0], 0(aout)
+    addiu   aout, aout, 16
+    bnez    agrp, aud_group
+    addiu   agrp, agrp, -1
     j       aud_next
     nop
 
 aud_ctl:
-    addiu   $t5, $t0, -3
+    addiu   $t5, ahdr, -3
     beqz    $t5, aud_ramp
-    sll     $t1, $t1, 2                 // BLOCK: frames * 4 bytes
-    bnez    $t0, aud_end
+    sll     ablen, ablen, 2             // BLOCK: frames * 4 bytes
+    bnez    ahdr, aud_end
     nop
 aud_wr_full:
     mfc0    $t0, SP_DMA_FULL
     bnez    $t0, aud_wr_full
     li      $t0, OUTB
     mtc0    $t0, SP_MEM_ADDR
-    mtc0    $gp, SP_DRAM_ADDR
-    addiu   $t1, $t1, -1
-    mtc0    $t1, SP_WR_LEN
+    mtc0    astep, SP_DRAM_ADDR
+    addiu   ablen, ablen, -1
+    mtc0    ablen, SP_WR_LEN
     jal     dma_wait                    // OUTB is cleared next
     nop
     jal     aud_clear
@@ -1899,15 +2120,15 @@ aud_wr_full:
     nop
 
 aud_ramp:
-    llv     avD[0], -12($s5)
-    llv     avD[4], -12($s5)
-    llv     avD[8], -12($s5)
+    llv     avD[0], -12(aptr)
+    llv     avD[4], -12(aptr)
+    llv     avD[8], -12(aptr)
     j       aud_next
-    llv     avD[12], -12($s5)
+    llv     avD[12], -12(aptr)
 
 aud_end:
     jal     load_viewport
-    li      $at, 1                      // matrix registers no longer match MTX
+    li      mtxdirty, 1                 // matrix registers no longer match MTX
     j       cmd_next
     nop
 
@@ -1924,6 +2145,21 @@ aud_clear_loop:
     sqv     vzero[0], -0x10($t0)
     jr      $ra
     nop
+    .undef arec
+    .undef aptr
+    .undef amask
+    .undef astep
+    .undef afrac
+    .undef ablen
+    .undef astart
+    .undef alast
+    .undef ahdr
+    .undef asrc
+    .undef apos
+    .undef aphase
+    .undef alastf
+    .undef agrp
+    .undef aout
     .balign 8
 OVL_AUDIO_END:
     .text
@@ -1960,58 +2196,78 @@ OVL_AUDIO_END:
     .def adM    $v18
     .def adH    $v19
     .def adX    $v20                    // first half
+    .def adC0   $v2                     // VADPCM matrix column 0
+    .def adC1   $v3                     // VADPCM matrix column 1
+    .def adC2   $v4                     // VADPCM matrix column 2
+    .def adC3   $v5                     // VADPCM matrix column 3
+    .def adC4   $v6                     // VADPCM matrix column 4
+    .def adC5   $v7                     // VADPCM matrix column 5
+    .def adC6   $v8                     // VADPCM matrix column 6
+    .def adC7   $v9                     // VADPCM matrix column 7
+    .def arec   $s4                     // next record chunk in RDRAM
+    .def aptr   $s5                     // record read pointer in SEGBUF
+    .def adin   $k0                     // (frames - 1) << 24 | input
+    .def adoutw $k1                     // mirror << 31 | out slot << 24 | output
+    .def adblk  $gp                     // in slot << 24 | decoder block
+    .def admsk  $t4                     // 0x00FFFFFF: address bits
+    .def adbase $t5                     // decoder block address
+    .def adslot $t7                     // RDRAM state slot ADST holds (-1: none)
+    .def adfrm  $t6                     // frames left - 1
+    .def adres  $t8                     // residuals of the frame (control byte at -1)
+    .def adone  $t1                     // 1 (<< scale)
+    .def adoptr $fp                     // ADOUT write pointer
     .overlay adpcm, OVL_SLOT
 adpcm_main:
-    move    $s4, w1                     // next record chunk in RDRAM
-    li      $s5, SEGBUF + SEGBUF_SIZE
+    move    arec, w1                    // next record chunk in RDRAM
+    li      aptr, SEGBUF + SEGBUF_SIZE
     sw      $zero, ADH + 12($zero)      // no decoder header loaded
-    li      $t7, -1                     // RDRAM state slot ADST holds (none)
-    // VADPCM matrix: identity x 2048 in $v2-$v9 (the lanes above the diagonal are
+    li      adslot, -1                  // RDRAM state slot ADST holds (none)
+    // VADPCM matrix: identity x 2048 in adC0-adC7 (the lanes above the diagonal are
     // reloaded per frame, the others stay)
     li      $t0, 0x800
-    vxor    $v2, vzero, vzero
-    mtc2    $t0, $v2[0]
-    vxor    $v3, vzero, vzero
-    mtc2    $t0, $v3[2]
-    vxor    $v4, vzero, vzero
-    mtc2    $t0, $v4[4]
-    vxor    $v5, vzero, vzero
-    mtc2    $t0, $v5[6]
-    vxor    $v6, vzero, vzero
-    mtc2    $t0, $v6[8]
-    vxor    $v7, vzero, vzero
-    mtc2    $t0, $v7[10]
-    vxor    $v8, vzero, vzero
-    mtc2    $t0, $v8[12]
-    vxor    $v9, vzero, vzero
-    mtc2    $t0, $v9[14]
+    vxor    adC0, vzero, vzero
+    mtc2    $t0, adC0[0]
+    vxor    adC1, vzero, vzero
+    mtc2    $t0, adC1[2]
+    vxor    adC2, vzero, vzero
+    mtc2    $t0, adC2[4]
+    vxor    adC3, vzero, vzero
+    mtc2    $t0, adC3[6]
+    vxor    adC4, vzero, vzero
+    mtc2    $t0, adC4[8]
+    vxor    adC5, vzero, vzero
+    mtc2    $t0, adC5[10]
+    vxor    adC6, vzero, vzero
+    mtc2    $t0, adC6[12]
+    vxor    adC7, vzero, vzero
+    mtc2    $t0, adC7[14]
     li      $t0, 16
     mtc2    $t0, adK[2]
     li      $t0, 32
     mtc2    $t0, adK[4]
 ad_next:
     li      $t0, SEGBUF + SEGBUF_SIZE
-    bne     $s5, $t0, ad_have
+    bne     aptr, $t0, ad_have
     li      dmem, SEGBUF
-    move    dram, $s4
+    move    dram, arec
     jal     dma_read
     li      dlen, SEGBUF_SIZE - 1
-    addiu   $s4, $s4, SEGBUF_SIZE
-    li      $s5, SEGBUF
+    addiu   arec, arec, SEGBUF_SIZE
+    li      aptr, SEGBUF
 ad_have:
-    lw      $t0, 0($s5)                 // 2 = decode, 1 = END
-    lw      $k0, 4($s5)                 // (frames - 1) << 24 | input
-    lw      $k1, 8($s5)                 // mirror, out slot, output
-    lw      $gp, 12($s5)                // in slot, decoder block
+    lw      $t0, 0(aptr)                // 2 = decode, 1 = END
+    lw      adin, 4(aptr)               // (frames - 1) << 24 | input
+    lw      adoutw, 8(aptr)             // mirror, out slot, output
+    lw      adblk, 12(aptr)             // in slot, decoder block
     addiu   $t0, $t0, -2
     bnez    $t0, ad_end
-    addiu   $s5, $s5, 16
-    lui     $t4, 0x00FF
-    ori     $t4, $t4, 0xFFFF
+    addiu   aptr, aptr, 16
+    lui     admsk, 0x00FF
+    ori     admsk, admsk, 0xFFFF
     lw      $t0, ADH + 12($zero)
-    and     $t5, $gp, $t4
-    beq     $t0, $t5, ad_samebook
-    move    dram, $t5
+    and     adbase, adblk, admsk
+    beq     $t0, adbase, ad_samebook
+    move    dram, adbase
     li      dmem, ADH
     jal     dma_read
     li      dlen, 15
@@ -2020,107 +2276,107 @@ ad_have:
     jal     dma_read
     li      dmem, ADCB
 ad_samebook:
-    srl     $t1, $gp, 20
+    srl     $t1, adblk, 20
     andi    $t1, $t1, 0xFF0             // in slot * 16
-    addu    dram, $t5, $t1
+    addu    dram, adbase, $t1
     addiu   dram, dram, 16
-    beq     dram, $t7, ad_havestate     // written by the previous record: still in ADST
+    beq     dram, adslot, ad_havestate  // written by the previous record: still in ADST
     li      dmem, ADST
     jal     dma_read
     li      dlen, 15
 ad_havestate:
-    srl     $t6, $k0, 24                // frames - 1
-    and     $t1, $k0, $t4
+    srl     adfrm, adin, 24             // frames - 1
+    and     $t1, adin, admsk
     andi    $t2, $t1, 7
     subu    dram, $t1, $t2
-    sll     $t3, $t6, 3
-    addu    $t3, $t3, $t6
+    sll     $t3, adfrm, 3
+    addu    $t3, $t3, adfrm
     addu    dlen, $t3, $t2              // (frames - 1) * 9 + misalignment + 8 bytes, - 1
     addiu   dlen, dlen, 8
     jal     dma_read
     li      dmem, ADIN
-    addiu   $t8, $t2, ADIN + 1          // residuals of the frame (control byte at -1)
-    li      $fp, ADOUT
+    addiu   adres, $t2, ADIN + 1        // residuals of the frame (control byte at -1)
+    li      adoptr, ADOUT
     lqv     adS[0], ADST($zero)
-    li      $t1, 1
+    li      adone, 1
 ad_frame:
-    lbu     $t0, -1($t8)
-    lpv     adR[0], 0($t8)
-    addiu   $t8, $t8, 9
+    lbu     $t0, -1(adres)
+    lpv     adR[0], 0(adres)
+    addiu   adres, adres, 9
     srl     $t2, $t0, 4
-    sllv    $t2, $t1, $t2
+    sllv    $t2, adone, $t2
     mtc2    $t2, adK[0]
     andi    $t0, $t0, 15
     sll     $t0, $t0, 5
     addiu   $t0, $t0, ADCB
     lqv     adP0[0], 0($t0)
     lqv     adP1[0], 16($t0)
-    lqv     $v2[2], 16($t0)
-    lqv     $v3[4], 16($t0)
-    lqv     $v4[6], 16($t0)
-    lqv     $v5[8], 16($t0)
-    lqv     $v6[10], 16($t0)
-    lqv     $v7[12], 16($t0)
-    lqv     $v8[14], 16($t0)
+    lqv     adC0[2], 16($t0)
+    lqv     adC1[4], 16($t0)
+    lqv     adC2[6], 16($t0)
+    lqv     adC3[8], 16($t0)
+    lqv     adC4[10], 16($t0)
+    lqv     adC5[12], 16($t0)
+    lqv     adC6[14], 16($t0)
     vmudm   adE, adR, adK[1]            // high nibbles, sign-extended (>> 12)
     vmudn   adO, adR, adK[1]            // low nibbles to the top (<< 4)
     vmudm   adO, adO, adK[1]
     vmudh   adE, adE, adK[0]            // << scale
     vmudh   adO, adO, adK[0]
-    vmudh   adT, $v2, adE[0]
-    vmadh   adT, $v3, adO[0]
-    vmadh   adT, $v4, adE[1]
-    vmadh   adT, $v5, adO[1]
-    vmadh   adT, $v6, adE[2]
-    vmadh   adT, $v7, adO[2]
-    vmadh   adT, $v8, adE[3]
-    vmadh   adT, $v9, adO[3]
+    vmudh   adT, adC0, adE[0]
+    vmadh   adT, adC1, adO[0]
+    vmadh   adT, adC2, adE[1]
+    vmadh   adT, adC3, adO[1]
+    vmadh   adT, adC4, adE[2]
+    vmadh   adT, adC5, adO[2]
+    vmadh   adT, adC6, adE[3]
+    vmadh   adT, adC7, adO[3]
     vmadh   adT, adP0, adS[6]
     vmadh   adT, adP1, adS[7]
     vsar    adM, vzero, vzero[1]
     vsar    adH, vzero, vzero[0]
     vmudn   adT, adM, adK[2]            // (acc >> 16) * 32 >> 16 = sum >> 11, clamped
     vmadh   adX, adH, adK[2]
-    vmudh   adT, $v2, adE[4]
-    vmadh   adT, $v3, adO[4]
-    vmadh   adT, $v4, adE[5]
-    vmadh   adT, $v5, adO[5]
-    vmadh   adT, $v6, adE[6]
-    vmadh   adT, $v7, adO[6]
-    vmadh   adT, $v8, adE[7]
-    vmadh   adT, $v9, adO[7]
+    vmudh   adT, adC0, adE[4]
+    vmadh   adT, adC1, adO[4]
+    vmadh   adT, adC2, adE[5]
+    vmadh   adT, adC3, adO[5]
+    vmadh   adT, adC4, adE[6]
+    vmadh   adT, adC5, adO[6]
+    vmadh   adT, adC6, adE[7]
+    vmadh   adT, adC7, adO[7]
     vmadh   adT, adP0, adX[6]
     vmadh   adT, adP1, adX[7]
     vsar    adM, vzero, vzero[1]
     vsar    adH, vzero, vzero[0]
     vmudn   adT, adM, adK[2]
     vmadh   adS, adH, adK[2]
-    sqv     adX[0], 0($fp)
-    sqv     adS[0], 16($fp)
-    addiu   $fp, $fp, 32
-    bnez    $t6, ad_frame
-    addiu   $t6, $t6, -1
+    sqv     adX[0], 0(adoptr)
+    sqv     adS[0], 16(adoptr)
+    addiu   adoptr, adoptr, 32
+    bnez    adfrm, ad_frame
+    addiu   adfrm, adfrm, -1
     // samples out
     li      dmem, ADOUT
-    and     dram, $k1, $t4
-    srl     $t6, $k0, 24
-    sll     dlen, $t6, 5
+    and     dram, adoutw, admsk
+    srl     adfrm, adin, 24
+    sll     dlen, adfrm, 5
     jal     ad_write
     addiu   dlen, dlen, 31
-    bgez    $k1, ad_nomirror
+    bgez    adoutw, ad_nomirror
     li      dlen, 31
     jal     ad_write
     lw      dram, ADH + 8($zero)
 ad_nomirror:
-    srl     $t1, $k1, 20
+    srl     $t1, adoutw, 20
     andi    $t1, $t1, 0x7F0             // out slot * 16
     sqv     adS[0], ADST($zero)
     beqz    $t1, ad_next
-    li      $t7, -1
-    and     dram, $gp, $t4
+    li      adslot, -1
+    and     dram, adblk, admsk
     addu    dram, dram, $t1
     addiu   dram, dram, 16
-    move    $t7, dram
+    move    adslot, dram
     li      dmem, ADST
     jal     ad_write
     li      dlen, 15
@@ -2131,18 +2387,38 @@ ad_end:
     jal     dma_wait                    // decoded samples in RDRAM
     nop
     jal     load_viewport
-    li      $at, 1                      // matrix registers no longer match MTX
+    li      mtxdirty, 1                 // matrix registers no longer match MTX
     j       cmd_next
     nop
 
 ad_write:                               // DMEM dmem -> RDRAM dram, dlen + 1 bytes (no wait:
-    mfc0    $t0, SP_DMA_FULL            // the next dma_read waits for the queue)
-    bnez    $t0, ad_write
+    mfc0    dmastat, SP_DMA_FULL        // the next dma_read waits for the queue)
+    bnez    dmastat, ad_write
     nop
     mtc0    dmem, SP_MEM_ADDR
     mtc0    dram, SP_DRAM_ADDR
     jr      $ra
     mtc0    dlen, SP_WR_LEN
+    .undef arec
+    .undef aptr
+    .undef adin
+    .undef adoutw
+    .undef adblk
+    .undef admsk
+    .undef adbase
+    .undef adslot
+    .undef adfrm
+    .undef adres
+    .undef adone
+    .undef adoptr
+    .undef adC0
+    .undef adC1
+    .undef adC2
+    .undef adC3
+    .undef adC4
+    .undef adC5
+    .undef adC6
+    .undef adC7
     .balign 8
 OVL_ADPCM_END:
     .text
@@ -2180,21 +2456,45 @@ OVL_ADPCM_END:
     .def vH     $v30                    // packed RDP words, high halves
     .def vL     $v15                    // low halves (vwni)
     .def vK     $v31                    // command | tile bits: cmd << 8, 0, tile << 8, 0 (twice)
+    .def pleft   $s4                    // particles left in the block
+    .def pnum    $k0                    // particles left in this chunk
+    .def psrc    $gp                    // next particles in RDRAM
+    .def pin     $k1                    // pair being transformed, in INBUF
+    .def pcur    $t8                    // its PSCR buffer (vector pass writes)
+    .def pprev   $t9                    // the previous pair's buffer (scalar emit reads)
+    .def prej    $a1                    // reject bits of the previous pair (VCC: A 0x0F/0x400, B 0xF0/0x4000)
+    .def pnrej   $s7                    // reject bits being gathered for this pair
+    .def pkeep   $a3                    // 1: the particle being emitted is drawn
+    .def prgba   $a0                    // its colour
+    .def pst     $a2                    // its s << 16 | t (moved by part_cut)
+    .def pw0     $t0                    // its RDP words 0, 1
+    .def pw1     $t1
+    .def pcut    $t2                    // its cut x << 16 | cut y (negative: not cut)
+    .def pdsdx   $t4                    // its dsdx, then dsdx << 16 | dsdx (dtdy)
+    .def psend   $t7                    // 1: send PRIM_COLOR before it
+    .def pcol    $fp                    // last PRIM_COLOR sent
+    .def pcolnew $v1                    // 1: no PRIM_COLOR sent yet in this block
+    .def pcolen  $s2                    // PRIM_COLOR enabled: 0 or 1
+    .def pzb     $s5                    // PRIM_DEPTH bytes: 0 or 8
+    .def prect   $s6                    // rectangle bytes: 8 (FILL_RECT) or 16 (TEXRECT)
+    .def hdepth  $s0                    // PRIM_DEPTH, PRIM_COLOR command words (cmdptr..cmdend saved in LIGHTTMP)
+    .def hcolor  $s1
+    .def prects  $sp                    // rectangles emitted (PARTCOUNT)
     .overlay part, OVL_SLOT
 part_main:
     li      dmem, INBUF
     move    dram, w1
     jal     dma_read                    // also waits for a MTX DMA in flight
     li      dlen, 15
-    beqz    $at, part_mtx_ok
+    beqz    mtxdirty, part_mtx_ok
     sw      cmdptr, LIGHTTMP + 0($zero) // s0-s2 hold loop constants until the block ends
     jal     load_matrix
-    li      $at, 0
+    li      mtxdirty, 0
 part_mtx_ok:
     sw      cmdcur, LIGHTTMP + 4($zero)
     li      $t8, INBUF
     lw      $t0, 0($t8)                 // C
-    lhu     $s4, 4($t8)                 // particles left
+    lhu     pleft, 4($t8)               // particles left
     lbu     $t1, 6($t8)                 // flags
     lbu     $t2, 7($t8)                 // tile
     lbu     $t3, 8($t8)                 // texture size = 2^shift texels
@@ -2221,46 +2521,46 @@ part_k:
     lqv     vpc[0], 0($t9)
     ldv     vK[0], 16($t9)
     ldv     vK[8], 16($t9)
-    sll     $s6, $t5, 3
-    addiu   $s6, $s6, 8                 // rectangle bytes: 8 (FILL_RECT) or 16 (TEXRECT)
-    andi    $s5, $t1, PART_Z
-    sll     $s5, $s5, 2                 // PRIM_DEPTH bytes: 0 or 8
-    andi    $s2, $t1, PART_COLOR
-    srl     $s2, $s2, 2                 // PRIM_COLOR enabled: 0 or 1
-    lui     $s0, 0x2E00                 // PRIM_DEPTH
-    lui     $s1, 0x3A00                 // PRIM_COLOR
-    lw      $sp, PARTCOUNT($zero)       // rectangles, kept in $sp until the block ends
-    addiu   $gp, w1, 16                 // next particles in RDRAM
-    li      $v1, 1                      // PRIM_COLOR not sent yet
+    sll     prect, $t5, 3
+    addiu   prect, prect, 8             // rectangle bytes: 8 (FILL_RECT) or 16 (TEXRECT)
+    andi    pzb, $t1, PART_Z
+    sll     pzb, pzb, 2                 // PRIM_DEPTH bytes: 0 or 8
+    andi    pcolen, $t1, PART_COLOR
+    srl     pcolen, pcolen, 2           // PRIM_COLOR enabled: 0 or 1
+    lui     hdepth, 0x2E00              // PRIM_DEPTH
+    lui     hcolor, 0x3A00              // PRIM_COLOR
+    lw      prects, PARTCOUNT($zero)    // rectangles, kept in prects until the block ends
+    addiu   psrc, w1, 16                // next particles in RDRAM
+    li      pcolnew, 1                  // PRIM_COLOR not sent yet
 part_chunk:
-    beqz    $s4, part_end
-    sltiu   $t0, $s4, PART_CHUNK + 1
+    beqz    pleft, part_end
+    sltiu   $t0, pleft, PART_CHUNK + 1
     bnez    $t0, part_n
-    move    $k0, $s4
-    li      $k0, PART_CHUNK
+    move    pnum, pleft
+    li      pnum, PART_CHUNK
 part_n:
-    subu    $s4, $s4, $k0
+    subu    pleft, pleft, pnum
     li      dmem, INBUF
-    move    dram, $gp
-    sll     dlen, $k0, 4
+    move    dram, psrc
+    sll     dlen, pnum, 4
     jal     dma_read
     addiu   dlen, dlen, -1
-    sll     $t0, $k0, 4
-    addu    $gp, $gp, $t0
-    li      $k1, INBUF
-    li      $t8, PSCR                   // this pair's buffer
-    li      $t9, PSCR + 32              // the previous pair's
-    li      $a1, 0x0011                 // reject bits of the previous pair: none yet
+    sll     $t0, pnum, 4
+    addu    psrc, psrc, $t0
+    li      pin, INBUF
+    li      pcur, PSCR                  // this pair's buffer
+    li      pprev, PSCR + 32            // the previous pair's
+    li      prej, 0x0011                // reject bits of the previous pair: none yet
 
-// Software pipelined: each iteration runs the vector pass of pair N ($k1, into $t8) and
-// the scalar emit of pair N - 1 ($t9, rgba / st at -24 / -20 / -8 / -4 of $k1, reject bits
-// in $a1), interleaved for dual issue; one extra iteration drains the last pair.
+// Software pipelined: each iteration runs the vector pass of pair N (pin, into pcur) and
+// the scalar emit of pair N - 1 (pprev, rgba / st at -24 / -20 / -8 / -4 of pin, reject
+// bits in prej), interleaved for dual issue; one extra iteration drains the last pair.
 part_pair:
     lw      $t5, OUTLIMIT($zero)
-    ldv     vin[0], 0($k1)
+    ldv     vin[0], 0(pin)
     sltu    $t0, $t5, outptr
     beqz    $t0, part_room
-    ldv     vin[8], 16($k1)
+    ldv     vin[8], 16(pin)
     jal     flush_out                   // a pair takes at most 64 bytes
     nop
 part_room:
@@ -2278,184 +2578,184 @@ part_room:
     vmudl   vtmp, vcf, vtrans[3h]
     vmadm   vtmp, vci, vtrans[3h]
     vmadn   vcf, vcf, vscale[3h]
-    lw      $t0, 0($t9)
+    lw      pw0, 0(pprev)
     vmadh   vci, vci, vscale[3h]
-    lw      $t1, 4($t9)
+    lw      pw1, 4(pprev)
     vch     vtmp, vci, vci[3h]
     vcl     vtmp, vcf, vcf[3h]
     vrcph   vrci[3], vci[3]
     vrcpl   vrcf[3], vcf[3]
-    lw      $t2, 8($t9)
+    lw      pcut, 8(pprev)
     cfc2    $at, vcc
     vrcph   vrci[3], vzero[0]
     vrcph   vrci[7], vci[7]
-    lh      $t4, 14($t9)
-    lw      $a2, -20($k1)
-    andi    $s7, $at, 0x4444
+    lh      pdsdx, 14(pprev)
+    lw      pst, -20(pin)
+    andi    pnrej, $at, 0x4444
     vrcpl   vrcf[7], vcf[7]
     vrcph   vrci[7], vzero[0]
-    andi    $a3, $a1, 0x040F
+    andi    pkeep, prej, 0x040F
     vmudn   vrcf, vrcf, vconst[2]
     vmadh   vrci, vrci, vconst[2]
     vmadn   vrcf, vzero, vzero[0]
     vsubc   vwnf, vzero, vcf
     vsub    vwni, vzero, vci
-    subu    $t5, $zero, $t2
+    subu    $t5, $zero, pcut
     bltzal  $t5, part_cut
-    sltiu   $a3, $a3, 1
+    sltiu   pkeep, pkeep, 1
     vmudl   vtmp, vwnf, vrcf
-    lh      $t3, 12($t9)
+    lh      $t3, 12(pprev)
     vmadm   vtmp, vwni, vrcf
     vmadn   vnf, vwnf, vrci
-    lw      $a0, -24($k1)
+    lw      prgba, -24(pin)
     vmadh   vni, vwni, vrci
-    sw      $s0, 0(outptr)
+    sw      hdepth, 0(outptr)
     vmudn   vtmp, vrcf, vconst[2]
     sll     $t3, $t3, 16
     vmadh   vtmp, vrci, vconst[2]
     sw      $t3, 4(outptr)
     vmadl   vtmp, vrcf, vnf
-    addu    $t5, outptr, $s5
+    addu    $t5, outptr, pzb
     vmadm   vtmp, vrci, vnf
-    xor     $t6, $a0, $fp
+    xor     $t6, prgba, pcol
     vmadn   vrcf, vrcf, vni
-    or      $t7, $t6, $v1
+    or      psend, $t6, pcolnew
     vmadh   vrci, vrci, vni
-    sltu    $t7, $zero, $t7
-    and     $t7, $t7, $a3
-    and     $t7, $t7, $s2
-    sw      $s1, 0($t5)
+    sltu    psend, $zero, psend
+    and     psend, psend, pkeep
+    and     psend, psend, pcolen
+    sw      hcolor, 0($t5)
     vmudl   vtmp, vcf, vrcf[3h]
     vmadm   vtmp, vci, vrcf[3h]
-    sw      $a0, 4($t5)
+    sw      prgba, 4($t5)
     vmadn   vnf, vcf, vrci[3h]
-    sll     $t3, $t7, 3
+    sll     $t3, psend, 3
     vmadh   vni, vci, vrci[3h]
     addu    $t5, $t5, $t3
     vmudl   vtmp, vpf, vrcf[3h]
-    subu    $t3, $zero, $a3
+    subu    $t3, $zero, pkeep
     vmadm   vtmp, vpi, vrcf[3h]
     and     $t6, $t6, $t3
     vmadn   vtmp, vpf, vrci[3h]
-    xor     $fp, $fp, $t6
+    xor     pcol, pcol, $t6
     vmadh   vrad, vpi, vrci[3h]
-    sltu    $v1, $t7, $v1
+    sltu    pcolnew, psend, pcolnew
     vmudh   vtmp, vtrans, vconst[1]
-    sll     $t6, $t4, 16
+    sll     $t6, pdsdx, 16
     vmadn   vtmp, vnf, vscale
-    or      $t4, $t4, $t6
+    or      pdsdx, pdsdx, $t6
     vmadh   vscr, vni, vscale
-    sw      $t0, 0($t5)
+    sw      pw0, 0($t5)
     vrcp    vrl[3], vrad[3]
-    sw      $t1, 4($t5)
+    sw      pw1, 4($t5)
     vrcph   vrh[3], vzero[0]
-    sw      $a2, 8($t5)
+    sw      pst, 8($t5)
     vrcp    vrl[7], vrad[7]
-    sw      $t4, 12($t5)
+    sw      pdsdx, 12($t5)
     vrcph   vrh[7], vzero[0]
-    addu    $t5, $t5, $s6
+    addu    $t5, $t5, prect
     vmov    vscr[3], vrad[3]
     subu    $t5, $t5, outptr
     vmov    vscr[7], vrad[7]
     and     $t5, $t5, $t3
     addu    outptr, outptr, $t5
-    addu    $sp, $sp, $a3
-    lw      $t0, 16($t9)
+    addu    prects, prects, pkeep
+    lw      pw0, 16(pprev)
     vadd    vhi, vscr, vscr[3h]
     vsub    vlo, vscr, vscr[3h]
-    lw      $t1, 20($t9)
+    lw      pw1, 20(pprev)
     vmudl   vtmp, vrl, vpc[7]
-    lw      $t2, 24($t9)
+    lw      pcut, 24(pprev)
     vmadm   vtmp, vrh, vpc[7]
-    lh      $t4, 30($t9)
+    lh      pdsdx, 30(pprev)
     vmadn   vtmp, vrl, vpc[6]
-    lw      $a2, -4($k1)
+    lw      pst, -4(pin)
     vmadh   vds, vrh, vpc[6]
-    andi    $a3, $a1, 0x40F0
+    andi    pkeep, prej, 0x40F0
     vge     vtmp, vzero, vhi
-    subu    $t5, $zero, $t2
+    subu    $t5, $zero, pcut
     bltzal  $t5, part_cut
-    sltiu   $a3, $a3, 1
+    sltiu   pkeep, pkeep, 1
     cfc2    $at, vcc
     vge     vtmp, vlo, vpc[5]
-    lh      $t3, 28($t9)
-    lw      $a0, -8($k1)
+    lh      $t3, 28(pprev)
+    lw      prgba, -8(pin)
     andi    $at, $at, 0xBB
-    or      $s7, $s7, $at
+    or      pnrej, pnrej, $at
     cfc2    $at, vcc
     vge     vcut, vlo, vzero
     vlt     vhi, vhi, vpc[4]
-    sw      $s0, 0(outptr)
+    sw      hdepth, 0(outptr)
     sll     $t3, $t3, 16
     andi    $at, $at, 0xBB
     sw      $t3, 4(outptr)
-    or      $s7, $s7, $at
+    or      pnrej, pnrej, $at
     vge     vscr, vscr, vzero
     vsub    vlo, vcut, vlo
-    addu    $t5, outptr, $s5
+    addu    $t5, outptr, pzb
     vmov    vhi[2], vcut[0]
-    xor     $t6, $a0, $fp
+    xor     $t6, prgba, pcol
     vmov    vhi[3], vcut[1]
-    or      $t7, $t6, $v1
+    or      psend, $t6, pcolnew
     vmov    vhi[6], vcut[4]
-    sltu    $t7, $zero, $t7
+    sltu    psend, $zero, psend
     vmov    vhi[7], vcut[5]
-    and     $t7, $t7, $a3
+    and     psend, psend, pkeep
     vmov    vlo[2], vscr[2]
-    and     $t7, $t7, $s2
+    and     psend, psend, pcolen
     vmov    vlo[6], vscr[6]
-    sw      $s1, 0($t5)
+    sw      hcolor, 0($t5)
     vmov    vlo[3], vds[3]
-    sw      $a0, 4($t5)
+    sw      prgba, 4($t5)
     vand    vL, vhi, vpc[2]
-    sll     $t3, $t7, 3
+    sll     $t3, psend, 3
     vmudl   vH, vhi, vpc[5]
     addu    $t5, $t5, $t3
     vmov    vlo[7], vds[7]
-    subu    $t3, $zero, $a3
+    subu    $t3, $zero, pkeep
     and     $t6, $t6, $t3
-    xor     $fp, $fp, $t6
+    xor     pcol, pcol, $t6
     li      $at, 0x55
-    sltu    $v1, $t7, $v1
+    sltu    pcolnew, psend, pcolnew
     ctc2    $at, vcc
     vmudn   vL, vL, vpc[5]
     vadd    vH, vH, vK
-    sll     $t6, $t4, 16
-    or      $t4, $t4, $t6
-    sw      $t0, 0($t5)
-    sdv     vlo[0], 8($t8)
-    sw      $t1, 4($t5)
-    sdv     vlo[8], 24($t8)
+    sll     $t6, pdsdx, 16
+    or      pdsdx, pdsdx, $t6
+    sw      pw0, 0($t5)
+    sdv     vlo[0], 8(pcur)
+    sw      pw1, 4($t5)
+    sdv     vlo[8], 24(pcur)
     vor     vL, vL, vhi[1q]
-    sw      $a2, 8($t5)
-    sw      $t4, 12($t5)
-    addu    $t5, $t5, $s6
+    sw      pst, 8($t5)
+    sw      pdsdx, 12($t5)
+    addu    $t5, $t5, prect
     subu    $t5, $t5, outptr
     vmrg    vH, vH, vL[0q]
     and     $t5, $t5, $t3
     addu    outptr, outptr, $t5
-    addu    $sp, $sp, $a3
-    sdv     vH[0], 0($t8)
-    sdv     vH[8], 16($t8)
-    sltiu   $at, $k0, 2                 // odd count: B of the last pair is junk
+    addu    prects, prects, pkeep
+    sdv     vH[0], 0(pcur)
+    sdv     vH[8], 16(pcur)
+    sltiu   $at, pnum, 2                // odd count: B of the last pair is junk
     sll     $at, $at, 14
-    or      $a1, $s7, $at
-    addiu   $k0, $k0, -2
-    slti    $at, $k0, -1
-    xori    $t9, $t9, 0x20
-    addiu   $k1, $k1, 32
+    or      prej, pnrej, $at
+    addiu   pnum, pnum, -2
+    slti    $at, pnum, -1
+    xori    pprev, pprev, 0x20
+    addiu   pin, pin, 32
     beqz    $at, part_pair
-    xori    $t8, $t8, 0x20
+    xori    pcur, pcur, 0x20
     j       part_chunk
     nop
 
-// Rectangle crossing the left / top edge: st ($a2, s << 16 | t) += cut x * dsdx >> 7 << 16 |
-// cut y * dsdx >> 7 ($t2 = cut x << 16 | cut y, $t4 = dsdx). No scalar multiply: shift and
+// Rectangle crossing the left / top edge: st (pst, s << 16 | t) += cut x * dsdx >> 7 << 16 |
+// cut y * dsdx >> 7 (pcut = cut x << 16 | cut y, pdsdx = dsdx). No scalar multiply: shift and
 // add. Clobbers at, t2, t3, t5-t7 only (called from the middle of the pipelined pair).
 part_cut:
-    srl     $t3, $t2, 16
-    andi    $t2, $t2, 0xFFFF
-    move    $at, $t4
+    srl     $t3, pcut, 16
+    andi    pcut, pcut, 0xFFFF
+    move    $at, pdsdx
     li      $t6, 0
     li      $t7, 0
 part_mul:
@@ -2463,41 +2763,67 @@ part_mul:
     beqz    $t5, part_mul1
     srl     $at, $at, 1
     addu    $t6, $t6, $t3
-    addu    $t7, $t7, $t2
+    addu    $t7, $t7, pcut
 part_mul1:
     sll     $t3, $t3, 1
     bnez    $at, part_mul
-    sll     $t2, $t2, 1
+    sll     pcut, pcut, 1
     srl     $t6, $t6, 7
     srl     $t7, $t7, 7
     sll     $t6, $t6, 16
-    addu    $t7, $a2, $t7
+    addu    $t7, pst, $t7
     andi    $t7, $t7, 0xFFFF            // t
-    addu    $a2, $a2, $t6
-    andi    $t5, $a2, 0xFFFF
-    xor     $a2, $a2, $t5               // s
+    addu    pst, pst, $t6
+    andi    $t5, pst, 0xFFFF
+    xor     pst, pst, $t5               // s
     jr      $ra
-    or      $a2, $a2, $t7
+    or      pst, pst, $t7
 part_end:
     lw      cmdptr, LIGHTTMP + 0($zero)
     lw      cmdcur, LIGHTTMP + 4($zero)
     li      cmdend, CMDBUF + CMDBUF_SIZE
-    sw      $sp, PARTCOUNT($zero)
+    sw      prects, PARTCOUNT($zero)
     j       cmd_next
-    li      $at, 0                      // matrix loaded
+    li      mtxdirty, 0                 // matrix loaded
+    .undef pleft
+    .undef pnum
+    .undef psrc
+    .undef pin
+    .undef pcur
+    .undef pprev
+    .undef prej
+    .undef pnrej
+    .undef pkeep
+    .undef prgba
+    .undef pst
+    .undef pw0
+    .undef pw1
+    .undef pcut
+    .undef pdsdx
+    .undef psend
+    .undef pcol
+    .undef pcolnew
+    .undef pcolen
+    .undef pzb
+    .undef prect
+    .undef hdepth
+    .undef hcolor
+    .undef prects
     .balign 8
 OVL_PART_END:
     .text
 
-// Overlay $t0 (OVL_*: byte offset in OVL_TABLE) into its IMEM slot, unless resident.
+// Overlay ovlid ($t0, OVL_*: byte offset in OVL_TABLE) into its IMEM slot, unless resident.
 // Synchronous. Clobbers t0-t2.
+    .def ovlid   $t0             // OVL_* (byte offset in OVL_TABLE)
+    .def ovlent  $t2             // its OVL_TABLE entry
 ovl_load:
     lw      $t1, OVL_RESIDENT($zero)
-    beq     $t1, $t0, ovl_done
-    lw      $t2, OVL_TABLE + 0($t0)     // length code << 24 | RDRAM address
-    sw      $t0, OVL_RESIDENT($zero)
+    beq     $t1, ovlid, ovl_done
+    lw      ovlent, OVL_TABLE + 0(ovlid) // length code << 24 | RDRAM address
+    sw      ovlid, OVL_RESIDENT($zero)
     li      $t1, cmd_vtx_ovl
-    bnez    $t0, ovl_tab
+    bnez    ovlid, ovl_tab
     nop
     li      $t1, cmd_vtx
 ovl_tab:
@@ -2507,10 +2833,10 @@ ovl_full:
     bnez    $t1, ovl_full
     li      $t1, 0x1000 + OVL_SLOT
     mtc0    $t1, SP_MEM_ADDR
-    sll     $t1, $t2, 8
+    sll     $t1, ovlent, 8
     srl     $t1, $t1, 8
     mtc0    $t1, SP_DRAM_ADDR
-    srl     $t1, $t2, 24
+    srl     $t1, ovlent, 24
     sll     $t1, $t1, 3                 // length - 1 (the DMA rounds up to 8 bytes)
     mtc0    $t1, SP_RD_LEN
 ovl_wait:
@@ -2521,6 +2847,8 @@ ovl_done:
     jr      $ra
     nop
 
+    .undef ovlid
+    .undef ovlent
 cmd_audio_ovl:
     jal     ovl_load
     li      $t0, OVL_AUDIO
@@ -2537,15 +2865,25 @@ cmd_part_ovl:
     j       part_main
     nop
 
-tri_rejclip:                            // t0-t2 = vertex flags, t4 = their OR (masked)
-    and     $t3, $t0, $t1
-    and     $t3, $t3, $t2
-    andi    $t3, $t3, CLIP_REJECT       // planes all vertices are outside of
-    bnez    $t3, tri_done               // rejected
-    andi    $t4, $t4, CLIP_PLANES_MASK
-    beqz    $t4, tri_vis                // only past the screen edges: the scissor's job
+    .def fl1     $t0             // clip flags of p1, p2, p3 (from tri)
+    .def fl2     $t1             //
+    .def fl3     $t2             //
+    .def clipor  $t4             // their OR, then the planes to clip against
+    .def flall   $t3             // their AND
+tri_rejclip:                            // fl1-fl3, clipor (masked) from tri
+    and     flall, fl1, fl2
+    and     flall, flall, fl3
+    andi    flall, flall, CLIP_REJECT   // planes all vertices are outside of
+    bnez    flall, tri_done             // rejected
+    andi    clipor, clipor, CLIP_PLANES_MASK
+    beqz    clipor, tri_vis             // only past the screen edges: the scissor's job
     nop
-tri_clip_ovl:                           // keeps t4 (planes), w0, p1-p3, s7
+    .undef fl1
+    .undef fl2
+    .undef fl3
+    .undef clipor
+    .undef flall
+tri_clip_ovl:                           // keeps $t4 (planes), w0, p1-p3, tret
     jal     ovl_load
     li      $t0, OVL_CLIP
     j       tri_clip
@@ -2556,17 +2894,22 @@ tri_clip_ovl:                           // keeps t4 (planes), w0, p1-p3, s7
 // by the next flush_out (or flush_publish at END), once the DMA is known to be complete.
 // Moves to the next ring block when the data does not fit, as k64_rdp_overflow does.
 // Clobbers t0-t7.
+    .def fhalf   $t0             // DMEM start of the OUTBUF half being sent
+    .def fbytes  $t1             // its bytes
+    .def rcur    $t2             // RING_CUR: where they go in RDRAM
+    .def rend    $t3             // RING_END of the current block
+    .def fret    $t7             // return address (flush_publish is called)
 flush_out:
-    lw      $t0, OUTLIMIT($zero)
-    addiu   $t0, $t0, TRI_MAX - OUTBUF_HALF     // start of the half
-    subu    $t1, outptr, $t0
-    beqz    $t1, flush_done
-    move    $t7, $ra
+    lw      fhalf, OUTLIMIT($zero)
+    addiu   fhalf, fhalf, TRI_MAX - OUTBUF_HALF // start of the half
+    subu    fbytes, outptr, fhalf
+    beqz    fbytes, flush_done
+    move    fret, $ra
     jal     flush_publish               // the previous half is in RDRAM: hand it to the RDP
-    lw      $t2, RING_CUR($zero)
-    lw      $t3, RING_END($zero)
-    addu    $t4, $t2, $t1
-    sltu    $t4, $t3, $t4
+    lw      rcur, RING_CUR($zero)
+    lw      rend, RING_END($zero)
+    addu    $t4, rcur, fbytes
+    sltu    $t4, rend, $t4
     beqz    $t4, flush_dma
     nop
 flush_next_block:                       // the RDP must have latched the current block's START
@@ -2579,38 +2922,44 @@ flush_next_block:                       // the RDP must have latched the current
     andi    $t5, $t5, 3
     sw      $t5, RING_IDX($zero)
     sll     $t5, $t5, 2
-    lw      $t2, RING($t5)
+    lw      rcur, RING($t5)
     sw      $zero, RING_STARTED($zero)
-    sw      $t2, RING_PUB($zero)
-    li      $t3, RING_BLOCK_BYTES
-    addu    $t3, $t2, $t3
-    sw      $t3, RING_END($zero)
+    sw      rcur, RING_PUB($zero)
+    li      rend, RING_BLOCK_BYTES
+    addu    rend, rcur, rend
+    sw      rend, RING_END($zero)
 flush_dma:
     mfc0    $t5, SP_DMA_FULL
     bnez    $t5, flush_dma
     nop
-    mtc0    $t0, SP_MEM_ADDR
-    mtc0    $t2, SP_DRAM_ADDR
-    addiu   $t5, $t1, -1
+    mtc0    fhalf, SP_MEM_ADDR
+    mtc0    rcur, SP_DRAM_ADDR
+    addiu   $t5, fbytes, -1
     mtc0    $t5, SP_WR_LEN
-    addu    $t2, $t2, $t1
-    sw      $t2, RING_CUR($zero)
-    xori    outptr, $t0, OUTBUF ^ (OUTBUF + OUTBUF_HALF)   // other half
-    addiu   $t0, outptr, OUTBUF_HALF - TRI_MAX
-    jr      $t7
+    addu    rcur, rcur, fbytes
+    sw      rcur, RING_CUR($zero)
+    xori    outptr, fhalf, OUTBUF ^ (OUTBUF + OUTBUF_HALF) // other half
+    addiu   $t0, outptr, OUTBUF_HALF - TRI_MAX  // new OUTLIMIT
+    jr      fret
     sw      $t0, OUTLIMIT($zero)
+    .undef fhalf
+    .undef fbytes
+    .undef rcur
+    .undef rend
+    .undef fret
 flush_done:
     jr      $ra
     nop
 
 // Waits for the DMAs in flight, then hands the ring up to RING_CUR to the RDP (DPC_START on a
 // fresh block, DPC_END). Clobbers t5, t6.
+    .def rpub    $t6             // RING_PUB: the ring up to here is the RDP's
 flush_publish:
     mfc0    $t5, SP_DMA_BUSY
     bnez    $t5, flush_publish
-    lw      $t6, RING_PUB($zero)
+    lw      rpub, RING_PUB($zero)
     lw      $t5, RING_CUR($zero)
-    beq     $t5, $t6, flush_pub_done
+    beq     $t5, rpub, flush_pub_done
     lw      $t5, RING_STARTED($zero)
     bnez    $t5, flush_pub_end
     nop
@@ -2619,12 +2968,13 @@ flush_pub_start:
     andi    $t5, $t5, 0x400
     bnez    $t5, flush_pub_start
     li      $t5, 1
-    mtc0    $t6, DPC_START
+    mtc0    rpub, DPC_START
     sw      $t5, RING_STARTED($zero)
 flush_pub_end:
-    lw      $t6, RING_CUR($zero)
-    sw      $t6, RING_PUB($zero)
-    mtc0    $t6, DPC_END
+    lw      rpub, RING_CUR($zero)
+    sw      rpub, RING_PUB($zero)
+    mtc0    rpub, DPC_END
+    .undef rpub
 flush_pub_done:
     jr      $ra
     nop
@@ -2656,15 +3006,15 @@ load_viewport:
 
 // Synchronous DMA RDRAM -> DMEM: dmem, dram, dlen = length - 1.
 dma_read:
-    mfc0    $t0, SP_DMA_FULL
-    bnez    $t0, dma_read
+    mfc0    dmastat, SP_DMA_FULL
+    bnez    dmastat, dma_read
     nop
     mtc0    dmem, SP_MEM_ADDR
     mtc0    dram, SP_DRAM_ADDR
     mtc0    dlen, SP_RD_LEN
 dma_wait:
-    mfc0    $t0, SP_DMA_BUSY
-    bnez    $t0, dma_wait
+    mfc0    dmastat, SP_DMA_BUSY
+    bnez    dmastat, dma_wait
     nop
     jr      $ra
     nop

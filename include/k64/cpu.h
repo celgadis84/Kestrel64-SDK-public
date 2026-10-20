@@ -16,6 +16,7 @@
 #define K64_C0_READ(reg) ({ u32 _v; __asm__ volatile("mfc0 %0, $" #reg : "=r"(_v)); _v; })
 #define K64_C0_WRITE(reg, v) __asm__ volatile("mtc0 %0, $" #reg "\n\tnop" :: "r"((u32)(v)))
 
+// Count (half the CPU clock, wraps every ~91 s: compare with u32 differences) and Status.
 K64_INLINE u32  k64_count(void)          { return K64_C0_READ(9); }
 K64_INLINE u32  k64_status(void)         { return K64_C0_READ(12); }
 K64_INLINE void k64_set_status(u32 v)    { K64_C0_WRITE(12, v); }
@@ -23,6 +24,7 @@ K64_INLINE void k64_set_status(u32 v)    { K64_C0_WRITE(12, v); }
 // Count runs at 46.875 MHz: 1 us = 46.875 ticks.
 #define K64_TICKS_PER_US   47u
 #define K64_US(t)          ((u32)(((u64)(t) * 1000000u) / K64_COUNT_HZ))
+// Busy waits (no yield to other threads). K64_TICKS_PER_US rounds 46.875 up: ~0.3% long.
 K64_INLINE void k64_wait_ticks(u32 t) { u32 s = k64_count(); while ((u32)(k64_count() - s) < t) {} }
 K64_INLINE void k64_wait_us(u32 us)   { k64_wait_ticks(us * K64_TICKS_PER_US); }
 
@@ -41,10 +43,14 @@ enum {
   K64_D_HIT_WRITEBACK      = 0x19,
 };
 
+// Ranges are widened to whole lines: p need not be aligned, but invalidate also drops the
+// other bytes of a partial first / last line, so buffers the RCP writes should be 16-byte
+// aligned and padded. Ranges of a whole cache or more fall back to the _all variants.
 void k64_dcache_writeback(const void *p, u32 len);
 void k64_dcache_invalidate(void *p, u32 len);       // discards dirty data in range!
 void k64_dcache_writeback_invalidate(const void *p, u32 len);
-void k64_dcache_writeback_all(void);
+void k64_dcache_writeback_all(void);                // also invalidates: the D$ is empty after
+// After writing code to RAM (loading an overlay, a JIT); also needs the D$ written back.
 void k64_icache_invalidate(const void *p, u32 len);
 void k64_icache_invalidate_all(void);
 
@@ -53,4 +59,5 @@ void k64_icache_invalidate_all(void);
 K64_INLINE u32 k64_irq_disable(void) { u32 s = k64_status(); k64_set_status(s & ~1u); return s & 1u; }
 K64_INLINE void k64_irq_restore(u32 ie) { k64_set_status((k64_status() & ~1u) | ie); }
 
+// Orders CPU loads / stores (sync); not a cache operation.
 K64_INLINE void k64_memory_barrier(void) { __asm__ volatile("sync" ::: "memory"); }

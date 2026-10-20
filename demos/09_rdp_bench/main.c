@@ -40,7 +40,10 @@ static void screen_tris(u32 flags) {
   k64_rdp_tri(flags, 0, &a, &b, &c);
   k64_rdp_tri(flags, 0, &a, &c, &d);
 }
-static void set_fill(void) { k64_rdp_set_other_modes(K64_OM_FILL); k64_rdp_set_fill_color(k64_rgba16(40, 80, 160, 255) * 0x10001u); }
+static void set_fill(void) {
+  k64_rdp_set_other_modes(K64_OM_FILL);
+  k64_rdp_set_fill_color(k64_rgba16(40, 80, 160, 255) * 0x10001u);
+}
 static void set_1c(u64 cyc) {
   k64_rdp_set_other_modes((K64_OM_1C_OPAQUE & ~K64_OM_CYCLE_2) | cyc);
   k64_rdp_set_combine(K64_CC_PRIM);
@@ -194,7 +197,8 @@ int main(void) {
     target();
     final_frame();
     for (u32 i = 0; i < NT; i++)
-      k64_text_printf(4, 6 + i * 9, 0xFFFFFFFF, "%-16s%8u%8u%6u", tests[i].name, res[i].wall, res[i].busy, res[i].cpu_us);
+      k64_text_printf(4, 6 + i * 9, 0xFFFFFFFF, "%-16s%8u%8u%6u", tests[i].name, res[i].wall, res[i].busy,
+                      res[i].cpu_us);
     k64_rdp_wait_idle();
     k64_display_show(fb);
     if (frame == 2) k64_printf("[09] done\n");

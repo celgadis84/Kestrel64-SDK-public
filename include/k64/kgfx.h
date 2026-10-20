@@ -61,6 +61,7 @@ enum {
   K64_KGFX_OP_END = 0x1F,
 };
 
+// Float matrix to the microcode's s15.16 layout; elements beyond +-32768 saturate.
 void k64_mtx_to_fixed(k64_mtxfx_t *out, const k64_mat4_t *m);
 // Full-screen viewport for a w x h surface, depth mapped to 0..0x7FFE. W normalize K = 1.
 void k64_viewport_set(k64_viewport_t *vp, u32 w, u32 h);
@@ -73,6 +74,8 @@ void k64_viewport_set(k64_viewport_t *vp, u32 w, u32 h);
 // given in the projection's units) are unchanged.
 void k64_viewport_wnorm(k64_viewport_t *vp, float near, float far);
 
+// Records into buf (words u64 commands; 8-byte aligned, KSEG0). k64_kgfx_cmd asserts on
+// overflow. Every command builder below appends one command.
 K64_INLINE void k64_kgfx_begin(k64_kgfx_list_t *l, u64 *buf, u32 words) {
   l->base = l->cur = buf; l->end = buf + words;
 }
@@ -80,6 +83,7 @@ K64_INLINE void k64_kgfx_cmd(k64_kgfx_list_t *l, u32 hi, u32 lo) {
   K64_ASSERT(l->cur < l->end);
   *l->cur++ = ((u64)hi << 32) | lo;
 }
+// Loads the matrix that VTX applies (the whole model-view-projection: no stack).
 K64_INLINE void k64_kgfx_mtx(k64_kgfx_list_t *l, const k64_mtxfx_t *m) {
   k64_kgfx_cmd(l, (u32)K64_KGFX_OP_MTX << 24, K64_PHYS(m));
 }
@@ -102,6 +106,7 @@ K64_INLINE void k64_kgfx_vtx_colidx(k64_kgfx_list_t *l, const k64_vtx_t *v, u32 
   K64_ASSERT(n && dest + n <= K64_KGFX_COLTAB_SLOT);
   k64_kgfx_cmd(l, ((u32)K64_KGFX_OP_VTX << 24) | (dest << 16) | (n << 8) | 1, K64_PHYS(v));
 }
+// Loads the colour table read by k64_kgfx_vtx_colidx (see above).
 K64_INLINE void k64_kgfx_col(k64_kgfx_list_t *l, u32 offset) {
   k64_kgfx_cmd(l, (u32)K64_KGFX_OP_VTX << 24, offset);
 }
@@ -126,7 +131,12 @@ typedef struct { k64_vec3_t dir; u8 r, g, b; } k64_kgfx_light_t;   // dir: towar
 // Microcode layout (160 bytes): light directions as columns (x, y, z of lights 0..3, twice,
 // Q14), light colors (r, g, b, 0, Q15, twice), ambient (r, g, b, 1.0, Q14, twice), normal
 // decode constants.
-typedef struct K64_ALIGN(16) { s16 dir[3][8]; s16 col[K64_KGFX_LIGHTS][8]; s16 amb[8]; u16 nshift[8], nmask[8]; } k64_kgfx_lights_t;
+typedef struct K64_ALIGN(16) {
+  s16 dir[3][8];
+  s16 col[K64_KGFX_LIGHTS][8];
+  s16 amb[8];
+  u16 nshift[8], nmask[8];
+} k64_kgfx_lights_t;
 
 // Packs a unit normal as 5.6.5 bits (x 15..11, y 10..5, z 4..0; tiny3d's encoding).
 u16 k64_kgfx_pack_normal(float x, float y, float z);
@@ -152,6 +162,7 @@ K64_INLINE void k64_kgfx_mtx_lights(k64_kgfx_list_t *l, const k64_kgfx_mtxlights
 // RSP works on the model-space normal. 112 bytes, 16-byte aligned.
 typedef struct K64_ALIGN(16) { s16 dir[3][8]; s16 scale[8], off[8]; u16 nshift[8], nmask[8]; } k64_kgfx_texgen_t;
 void k64_kgfx_texgen_set(k64_kgfx_texgen_t *out, const k64_mat4_t *modelview, u32 tex_w, u32 tex_h);
+// Loads a texgen block (same lifetime rule as a light block).
 K64_INLINE void k64_kgfx_texgen(k64_kgfx_list_t *l, const k64_kgfx_texgen_t *tg) {
   k64_kgfx_cmd(l, (u32)K64_KGFX_OP_TEXGEN << 24, K64_PHYS(tg));
 }
@@ -161,7 +172,8 @@ K64_INLINE void k64_kgfx_texgen(k64_kgfx_list_t *l, const k64_kgfx_texgen_t *tg)
 // into an address with one shift and a mask.
 #define K64_KGFX_VREF(slot) (0x20u + (u32)(slot) * 5)
 K64_INLINE void k64_kgfx_tri(k64_kgfx_list_t *l, u32 a, u32 b, u32 c) {
-  k64_kgfx_cmd(l, ((u32)K64_KGFX_OP_TRI << 24) | (K64_KGFX_VREF(a) << 16) | (K64_KGFX_VREF(b) << 8) | K64_KGFX_VREF(c), 0);
+  k64_kgfx_cmd(l, ((u32)K64_KGFX_OP_TRI << 24) | (K64_KGFX_VREF(a) << 16) | (K64_KGFX_VREF(b) << 8) | K64_KGFX_VREF(c),
+               0);
 }
 K64_INLINE void k64_kgfx_tri2(k64_kgfx_list_t *l, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f) {
   k64_kgfx_cmd(l, ((u32)K64_KGFX_OP_TRI << 24) | (K64_KGFX_VREF(a) << 16) | (K64_KGFX_VREF(b) << 8) | K64_KGFX_VREF(c),
@@ -177,6 +189,7 @@ K64_INLINE u64 *k64_kgfx_cull(k64_kgfx_list_t *l, u32 slots) {
   k64_kgfx_cmd(l, (u32)K64_KGFX_OP_CULL << 24, slots);
   return c;
 }
+// Closes the skip range of the CULL command that k64_kgfx_cull returned.
 K64_INLINE void k64_kgfx_cull_end(k64_kgfx_list_t *l, u64 *cull) {
   u32 n = (u32)(l->cur - cull - 1);
   K64_ASSERT(n < (1u << 24));
@@ -191,6 +204,7 @@ K64_INLINE void k64_kgfx_call(k64_kgfx_list_t *l, const u64 *sub) {
 K64_INLINE void k64_kgfx_call_col(k64_kgfx_list_t *l, const u64 *sub, const void *colbase) {
   k64_kgfx_cmd(l, ((u32)K64_KGFX_OP_CALL << 24) | (K64_PHYS(colbase) & 0xFFFFFF), K64_PHYS(sub));
 }
+// Ends a list run by CALL.
 K64_INLINE void k64_kgfx_ret(k64_kgfx_list_t *l) { k64_kgfx_cmd(l, (u32)K64_KGFX_OP_RET << 24, 0); }
 // Fog: VTX (after this command, until the end of the list) replaces each vertex alpha with
 // a fog factor, 0 at eye distance `start` rising linearly to 255 at `end` (the integer part

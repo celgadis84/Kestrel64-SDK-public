@@ -7,14 +7,22 @@ extern const u8 lato16[], lato12[], pixel[];
 static k64_font_t f16, f12, fpx;
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[20_fonts] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                             \
+  do {                                            \
+    if (!(c)) {                                   \
+      fails++;                                    \
+      k64_printf("[20_fonts] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                           \
+    }                                             \
+  } while (0)
 
 static const char *para =
   "El veloz murci\xC3\xA9lago hind\xC3\xBA com\xC3\xAD""a feliz cardillo y kiwi. "
   "La cig\xC3\xBC""e\xC3\xB1""a tocaba el saxof\xC3\xB3n detr\xC3\xA1s del palenque de paja.";
 
 static void self_test(void) {
-  CHECK(k64_font_from_blob(&f16, lato16) && k64_font_from_blob(&f12, lato12) && k64_font_from_blob(&fpx, pixel), "blob");
+  CHECK(k64_font_from_blob(&f16, lato16) && k64_font_from_blob(&f12, lato12) && k64_font_from_blob(&fpx, pixel),
+        "blob");
   CHECK(!f16.mono && fpx.mono, "mono flags %d %d", f16.mono, fpx.mono);
   CHECK(f16.ascii && f12.ascii && fpx.ascii, "ascii fast path");
   CHECK(f12.nsheets == 1, "lato12 sheets %u", f12.nsheets);
@@ -29,25 +37,34 @@ static void self_test(void) {
   int a = k64_font_width(&f16, "A"), v = k64_font_width(&f16, "V"), av = k64_font_width(&f16, "AV");
   CHECK(av < a + v, "kern AV %d vs %d+%d", av, a, v);
   CHECK(k64_font_width(&f16, "To") < k64_font_width(&f16, "T") + k64_font_width(&f16, "o"), "kern To");
-  CHECK(fpx.nkern == 0 && k64_font_width(&fpx, "AV") == k64_font_width(&fpx, "A") + k64_font_width(&fpx, "V"), "pixel no kern");
-  CHECK(k64_font_width(&f16, "") == 0 && k64_font_width(&f16, "ab\ncd") == k64_font_width(&f16, "ab"), "first line width");
+  CHECK(fpx.nkern == 0 && k64_font_width(&fpx, "AV") == k64_font_width(&fpx, "A") + k64_font_width(&fpx, "V"),
+        "pixel no kern");
+  CHECK(k64_font_width(&f16, "") == 0 && k64_font_width(&f16, "ab\ncd") == k64_font_width(&f16, "ab"),
+        "first line width");
   CHECK(k64_font_width(&f16, "\x02" "ab\x01") == k64_font_width(&f16, "ab"), "color codes take no space");
   // Boxes: one line when it fits, wrapping at spaces, a word wider than the box split.
   int lh = f16.line_height;
   CHECK(k64_font_box(&f16, 0, 0, 1000, 0, 0, "one line", false) == lh, "box one line");
-  CHECK(k64_font_box(&f16, 0, 0, k64_font_width(&f16, "aaa bbb") + 1, 0, 0, "aaa bbb ccc", false) == 2 * lh, "box wrap");
-  CHECK(k64_font_box(&f16, 0, 0, k64_font_width(&f16, "aaa") + 1, 0, 0, "aaaaaaaaa", false) == 3 * lh, "box split word");
+  CHECK(k64_font_box(&f16, 0, 0, k64_font_width(&f16, "aaa bbb") + 1, 0, 0, "aaa bbb ccc", false) == 2 * lh,
+        "box wrap");
+  CHECK(k64_font_box(&f16, 0, 0, k64_font_width(&f16, "aaa") + 1, 0, 0, "aaaaaaaaa", false) == 3 * lh,
+        "box split word");
   CHECK(k64_font_box(&f16, 0, 0, 1000, 0, 0, "a\nb\n\nc", false) == 4 * lh, "box newlines");
   CHECK(k64_font_box(&f16, 0, 0, 1, 0, 0, "abc", false) == 3 * lh, "box narrower than a glyph");
-  k64_printf("[20_fonts] lato16: %u glyphs %u kern %u sheets line %u | lato12: %u glyphs %u kern | m5x7: %u glyphs, mono\n",
-             f16.nglyphs, f16.nkern, f16.nsheets, f16.line_height, f12.nglyphs, f12.nkern, fpx.nglyphs);
+  k64_printf(
+      "[20_fonts] lato16: %u glyphs %u kern %u sheets line %u | lato12: %u glyphs %u kern | m5x7: %u glyphs, mono\n",
+      f16.nglyphs, f16.nkern, f16.nsheets, f16.line_height, f12.nglyphs, f12.nkern, fpx.nglyphs);
 }
 
 static void scene(void) {
   k64_font_set_shadow(1, 1, 0x000000C0);
   k64_font_draw(&f16, 12, 8, 0xFFFFFFFF, "kestrel64-sdk  \x02" "20" "\x01  proportional fonts");
   k64_font_set_shadow(0, 0, 0);
-  k64_font_printf(&f12, 12, 30, 0xC0C0C0FF, "self-test %s  \xC2\xB7  AV To Wa Ty  \xC2\xB7  \xC2\xBF" "Ma\xC3\xB1" "ana?", fails ? "FAIL" : "PASS");
+  k64_font_printf(&f12, 12, 30, 0xC0C0C0FF,
+                  "self-test %s  \xC2\xB7  AV To Wa Ty  \xC2\xB7  \xC2\xBF"
+                  "Ma\xC3\xB1"
+                  "ana?",
+                  fails ? "FAIL" : "PASS");
   k64_font_box(&f16, 12, 50, 140, K64_ALIGN_LEFT, 0xFFE0A0FF, para, true);
   k64_font_box(&f12, 168, 50, 140, K64_ALIGN_RIGHT, 0xA0E0FFFF, para, true);
   k64_font_box(&f12, 12, 170, 296, K64_ALIGN_CENTER, 0xFFFFFFFF,

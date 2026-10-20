@@ -8,6 +8,9 @@ Development happens in a private repository. This public repository receives the
 considered mature enough to release, as squashed snapshots, so its history is a list of
 releases, not of the work.
 
+**New here?** [docs/GETTING-STARTED.md](docs/GETTING-STARTED.md): requirements, your first
+ROM from `template/`, the frame loop, the cache rules, and a map of every header.
+
 ## Demos
 
 | ROM | Shows |
@@ -43,6 +46,7 @@ releases, not of the work.
 | 29_video | K64V video + VADPCM audio from ROM, RSP decode into the framebuffer, video/audio CRCs + RGB vs CPU (self-test) |
 | 30_texfmt | every baked texture format (RGBA16/32, YUV16, CI4/8 with RGBA16 or IA16 palettes, I4/8, IA4/8/16) drawn by the RDP vs a CPU decode (self-test) |
 | 31_memfill | k64_mem_fill (MI repeat mode) at every alignment, RDRAM checked, timing vs memset (self-test) |
+| 32_crash | crash screen: CPU exception, `k64_panic` and `K64_ASSERT` with register dump and backtrace |
 
 ## Build
 
@@ -51,7 +55,8 @@ cmake -S . -B build -G Ninja
 ninja -C build
 ```
 
-ROMs land in `build/demos/<name>/<name>.z64`. Docs: [docs/KGFX.md](docs/KGFX.md) (microcode),
+ROMs land in `build/demos/<name>/<name>.z64`. `tools/test/run_selftests.sh build` runs every
+self-test ROM headless in kestrel64 and prints PASS / FAIL per ROM. Docs: [docs/KGFX.md](docs/KGFX.md) (microcode),
 [docs/MODELS.md](docs/MODELS.md) (models/animation), [docs/RDP-MODES.md](docs/RDP-MODES.md),
 [docs/RSP-RESIDENCY.md](docs/RSP-RESIDENCY.md), [docs/ROADMAP.md](docs/ROADMAP.md).
 

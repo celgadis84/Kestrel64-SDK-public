@@ -4,7 +4,14 @@
 #include <k64/k64.h>
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[26_romfs] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                             \
+  do {                                            \
+    if (!(c)) {                                   \
+      fails++;                                    \
+      k64_printf("[26_romfs] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                           \
+    }                                             \
+  } while (0)
 
 static u8 odd_byte(u32 i) { return (u8)(i * 7 + 3); }
 
@@ -14,7 +21,8 @@ int main(void) {
   CHECK(k64_romfs_count() == 6, "count %u", k64_romfs_count());
 
   k64_file_t f;
-  CHECK(!k64_romfs_open(&f, "missing.txt") && !k64_romfs_open(&f, "levels") && !k64_romfs_open(&f, "README.TXT"), "missing");
+  CHECK(!k64_romfs_open(&f, "missing.txt") && !k64_romfs_open(&f, "levels") && !k64_romfs_open(&f, "README.TXT"),
+        "missing");
   // Tiny *.txt files do not shrink, so k64fs stores them raw.
   CHECK(k64_romfs_open(&f, "/levels/level2.txt") && !f.packed && f.size == 17, "leading slash, raw small file");
 
@@ -50,7 +58,8 @@ int main(void) {
   char *txt = k64_romfs_load("big.txt", &size);
   k64_romfs_open(&f, "big.txt");
   CHECK(txt && size == 400 * 38 && f.packed && f.size < size, "big.txt %u stored %u", size, f.size);
-  CHECK(txt && !__builtin_memcmp(txt, "line 0000 of", 12) && !__builtin_memcmp(txt + 399 * 38, "line 0399 of", 12), "big.txt content");
+  CHECK(txt && !__builtin_memcmp(txt, "line 0000 of", 12) && !__builtin_memcmp(txt + 399 * 38, "line 0399 of", 12),
+        "big.txt content");
   char *r = k64_romfs_load("readme.txt", &size);
   CHECK(r && size == 30 && !__builtin_memcmp(r, "kestrel64-sdk ROM file system\n", 30), "readme");
 

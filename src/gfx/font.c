@@ -90,7 +90,8 @@ static void set_modes(const k64_font_t *f) {
   } else {
     // Blend the glyph's coverage with the framebuffer; alpha compare still skips the
     // empty texels so they cost no framebuffer write.
-    om |= K64_OM_FORCE_BLEND | K64_OM_IMAGE_READ | K64_OM_BLEND(K64_BL_IN, K64_BL_A_IN, K64_BL_MEM, K64_BL_B_1MA, 0,0,0,0);
+    om |= K64_OM_FORCE_BLEND | K64_OM_IMAGE_READ
+          | K64_OM_BLEND(K64_BL_IN, K64_BL_A_IN, K64_BL_MEM, K64_BL_B_1MA, 0, 0, 0, 0);
     k64_rdp_set_blend_color(0x00000001);
   }
   k64_rdp_set_other_modes(om);
@@ -133,7 +134,7 @@ static int run(const k64_font_t *f, int x, int y, const u8 *s, const u8 *e, u8 *
     prev = gi;
     if (draw && g->w) {
       if (nbatch == BATCH) flush(f);
-      batch[nbatch++] = (item_t){ (s16)(x + ((pen + 2) >> 2) + g->xoff), (s16)(y + g->yoff), (u16)gi, *color, g->sheet };
+      batch[nbatch++] = (item_t){(s16)(x + ((pen + 2) >> 2) + g->xoff), (s16)(y + g->yoff), (u16)gi, *color, g->sheet};
       sheet_mask |= 1u << g->sheet;
     }
     pen += g->advance;

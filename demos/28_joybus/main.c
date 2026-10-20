@@ -5,7 +5,14 @@
 #include <k64/k64.h>
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[28_joybus] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                              \
+  do {                                             \
+    if (!(c)) {                                    \
+      fails++;                                     \
+      k64_printf("[28_joybus] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                            \
+    }                                              \
+  } while (0)
 
 static const char *names[] = { "none", "controller", "mouse", "VRU", "keyboard", "eeprom 4k", "eeprom 16k", "other" };
 

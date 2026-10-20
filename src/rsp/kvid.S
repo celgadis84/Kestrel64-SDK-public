@@ -107,7 +107,47 @@ smask:                          // chroma k of a half goes to lanes 2k, 2k + 1
     .def vk     $v25            // kconst
     .def vfill  $v26            // 128 << 7 in every lane
     .def vpred  $v27
-    // $v1-$v8 X_v / D_i, $v9-$v16 T_i, $v17-$v24 Mc_u
+    // IDCT
+    .def vrow0  $v1            // X_v coefficient row v, then D_i pixel row i
+    .def vrow1  $v2
+    .def vrow2  $v3
+    .def vrow3  $v4
+    .def vrow4  $v5
+    .def vrow5  $v6
+    .def vrow6  $v7
+    .def vrow7  $v8
+    .def vtr0   $v9            // T_i, pass 1 result
+    .def vtr1   $v10
+    .def vtr2   $v11
+    .def vtr3   $v12
+    .def vtr4   $v13
+    .def vtr5   $v14
+    .def vtr6   $v15
+    .def vtr7   $v16
+    .def vmc0   $v17            // Mc_u, u = 0..7, loaded once at START
+    .def vmc1   $v18
+    .def vmc2   $v19
+    .def vmc3   $v20
+    .def vmc4   $v21
+    .def vmc5   $v22
+    .def vmc6   $v23
+    .def vmc7   $v24
+    // colour conversion (reuses the IDCT registers, which are free by then)
+    .def vrc    $v1             // chroma terms of R, G, B for 8 chroma samples
+    .def vgc    $v2
+    .def vbc    $v3
+    .def vy7    $v4             // 8 luma samples << 7
+    .def vr     $v5             // channels of 8 pixels, then the packed RGBA5551
+    .def vg     $v6
+    .def vb     $v7
+    .def ve7    $v8             // (U - 128) << 7
+    .def vkc0   $v9             // kc0: conversion factors, 128 << 7, 255 << 7, 1
+    .def vkc1   $v10            // kc1: packing shifts and masks
+    .def vsm0   $v11            // smask rows: chroma k -> lanes 2k, 2k + 1
+    .def vsm1   $v12
+    .def vsm2   $v13
+    .def vsm3   $v14
+    .def vd7    $v15            // (V - 128) << 7
 
     .def cur    $s0             // work list cursor (DMEM)
     .def wend   $s1             // end of the valid window
@@ -125,54 +165,67 @@ smask:                          // chroma k of a half goes to lanes 2k, 2k + 1
     .def blk    $gp             // block 0..5 (Y0 Y1 Y2 Y3 U V)
     .def dst    $t6             // block pixels, row stride
     .def stride $t7
+    .def dmastat $t9            // SP_DMA_FULL / SP_DMA_BUSY polls
+    // strip DMA convention (strip_addr, dma_rd, dma_wr)
+    .def rowtab $sp             // in: YROW or RYROW, the three plane row addresses
+    .def dmem   $t3             // in: DMEM side of the next DMA
+    .def dram0  $t4             // RDRAM side of the next DMA, then the two after it
+    .def dram1  $t5
+    .def dram2  $a2
+    .def dlen   $a1             // length word of the next DMA
+    // $t0-$t5 are scratch unless a routine's header says otherwise
 
+// T_i = sum_v X_v * Mc_v[i]: one pass-1 row into \d.
 .macro PASS1 d, i
-    vmulf   \d, $v1, $v17[\i]
-    vmacf   \d, $v2, $v18[\i]
-    vmacf   \d, $v3, $v19[\i]
-    vmacf   \d, $v4, $v20[\i]
-    vmacf   \d, $v5, $v21[\i]
-    vmacf   \d, $v6, $v22[\i]
-    vmacf   \d, $v7, $v23[\i]
-    vmacf   \d, $v8, $v24[\i]
+    vmulf   \d, vrow0, vmc0[\i]
+    vmacf   \d, vrow1, vmc1[\i]
+    vmacf   \d, vrow2, vmc2[\i]
+    vmacf   \d, vrow3, vmc3[\i]
+    vmacf   \d, vrow4, vmc4[\i]
+    vmacf   \d, vrow5, vmc5[\i]
+    vmacf   \d, vrow6, vmc6[\i]
+    vmacf   \d, vrow7, vmc7[\i]
 .endm
 
+// D_i = sum_u Mc_u * T_i[u]: pixel row i into \d from T_i in \t.
 .macro PASS2 d, t
-    vmulf   \d, $v17, \t[0]
-    vmacf   \d, $v18, \t[1]
-    vmacf   \d, $v19, \t[2]
-    vmacf   \d, $v20, \t[3]
-    vmacf   \d, $v21, \t[4]
-    vmacf   \d, $v22, \t[5]
-    vmacf   \d, $v23, \t[6]
-    vmacf   \d, $v24, \t[7]
+    vmulf   \d, vmc0, \t[0]
+    vmacf   \d, vmc1, \t[1]
+    vmacf   \d, vmc2, \t[2]
+    vmacf   \d, vmc3, \t[3]
+    vmacf   \d, vmc4, \t[4]
+    vmacf   \d, vmc5, \t[5]
+    vmacf   \d, vmc6, \t[6]
+    vmacf   \d, vmc7, \t[7]
 .endm
 
+// One channel of 8 pixels into \d: y7 plus chroma term \c[e_k] on the lanes of sample k,
+// clamped to 0 .. 255 << 7.
 .macro CHAN d, c, e0, e1, e2, e3
-    vmudh   \d, $v4, $v9[7]            // y7
-    vmadh   \d, $v11, \c[\e0]
-    vmadh   \d, $v12, \c[\e1]
-    vmadh   \d, $v13, \c[\e2]
-    vmadh   \d, $v14, \c[\e3]
+    vmudh   \d, vy7, vkc0[7]            // y7 * 1
+    vmadh   \d, vsm0, \c[\e0]
+    vmadh   \d, vsm1, \c[\e1]
+    vmadh   \d, vsm2, \c[\e2]
+    vmadh   \d, vsm3, \c[\e3]
     vge     \d, \d, vzero
-    vlt     \d, \d, $v9[5]
+    vlt     \d, \d, vkc0[5]
 .endm
 
-// 8 pixels: luma at yoff(yb), chroma elements e0..e3 of $v1-$v3, RGBA5551 to ooff(ob).
+// 8 pixels: luma at yoff(yb), chroma elements e0..e3 of vrc / vgc / vbc, RGBA5551 to ooff(ob).
 .macro RGB8 yoff, yb, ooff, ob, e0, e1, e2, e3
-    luv     $v4[0], \yoff(\yb)
-    CHAN    $v5, $v1, \e0, \e1, \e2, \e3
-    CHAN    $v6, $v2, \e0, \e1, \e2, \e3
-    CHAN    $v7, $v3, \e0, \e1, \e2, \e3
-    vand    $v5, $v5, $v10[2]           // R >> 10 << 10
-    vmudm   $v6, $v6, $v10[0]
-    vand    $v6, $v6, $v10[3]           // G >> 10 << 5
-    vmudm   $v7, $v7, $v10[1]           // B >> 10
-    vor     $v5, $v5, $v6
-    vor     $v5, $v5, $v7
-    vmudn   $v5, $v5, $v10[5]           // << 1 (unsigned: up to 0xFFFE)
-    vor     $v5, $v5, $v10[4]
-    sqv     $v5[0], \ooff(\ob)
+    luv     vy7[0], \yoff(\yb)
+    CHAN    vr, vrc, \e0, \e1, \e2, \e3
+    CHAN    vg, vgc, \e0, \e1, \e2, \e3
+    CHAN    vb, vbc, \e0, \e1, \e2, \e3
+    vand    vr, vr, vkc1[2]             // R >> 10 << 10
+    vmudm   vg, vg, vkc1[0]
+    vand    vg, vg, vkc1[3]             // G >> 10 << 5
+    vmudm   vb, vb, vkc1[1]             // B >> 10
+    vor     vr, vr, vg
+    vor     vr, vr, vb
+    vmudn   vr, vr, vkc1[5]             // << 1 (unsigned: up to 0xFFFE)
+    vor     vr, vr, vkc1[4]             // alpha
+    sqv     vr[0], \ooff(\ob)
 .endm
 
 .macro PIXROW d
@@ -192,14 +245,14 @@ smask:                          // chroma k of a half goes to lanes 2k, 2k + 1
 START:
     vxor    vzero, vzero, vzero
     ctc2    $zero, vco
-    lqv     $v17[0], 0x00($zero)
-    lqv     $v18[0], 0x10($zero)
-    lqv     $v19[0], 0x20($zero)
-    lqv     $v20[0], 0x30($zero)
-    lqv     $v21[0], 0x40($zero)
-    lqv     $v22[0], 0x50($zero)
-    lqv     $v23[0], 0x60($zero)
-    lqv     $v24[0], 0x70($zero)
+    lqv     vmc0[0], mcol + 0x00($zero)
+    lqv     vmc1[0], mcol + 0x10($zero)
+    lqv     vmc2[0], mcol + 0x20($zero)
+    lqv     vmc3[0], mcol + 0x30($zero)
+    lqv     vmc4[0], mcol + 0x40($zero)
+    lqv     vmc5[0], mcol + 0x50($zero)
+    lqv     vmc6[0], mcol + 0x60($zero)
+    lqv     vmc7[0], mcol + 0x70($zero)
     lqv     vk[0], kconst($zero)
     vor     vfill, vzero, vk[2]
     lw      wbase, WORK($zero)
@@ -210,6 +263,8 @@ START:
     srl     nmb, $t0, 4
     li      mx, 0
 
+    .def width  $t0             // strip setup: luma, then chroma width in bytes
+    .def skip   $t1             // bytes skipped per DMA line, at the SKIP field (<< 20)
 strip_loop:
     subu    n, nmb, mx
     slti    $t0, n, STRIP + 1
@@ -219,27 +274,29 @@ strip_loop:
 strip_n:
     sll     ystr, n, 4
     sll     cstr, n, 3
-    lw      $t0, WIDTH($zero)
+    lw      width, WIDTH($zero)
     addiu   ylen, ystr, -1              // 16 rows of 16n, skipping the rest of the line
     ori     ylen, ylen, 15 << 12
-    subu    $t1, $t0, ystr
-    sll     $t1, $t1, 20
-    or      ylen, ylen, $t1
-    srl     $t0, $t0, 1
+    subu    skip, width, ystr
+    sll     skip, skip, 20
+    or      ylen, ylen, skip
+    srl     width, width, 1
     addiu   clen, cstr, -1              // 8 rows of 8n
     ori     clen, clen, 7 << 12
-    subu    $t1, $t0, cstr
-    sll     $t1, $t1, 20
-    or      clen, clen, $t1
+    subu    skip, width, cstr
+    sll     skip, skip, 20
+    or      clen, clen, skip
+    .undef width
+    .undef skip
 
     jal     strip_addr
-    li      $sp, RYROW                  // in: the previous frame
+    li      rowtab, RYROW               // in: the previous frame
     jal     dma_rd
-    li      $t3, YBUF
+    li      dmem, YBUF
     jal     dma_rd
-    li      $t3, UBUF
+    li      dmem, UBUF
     jal     dma_rd
-    li      $t3, VBUF
+    li      dmem, VBUF
     jal     dma_wait
     li      m, 0
 
@@ -258,42 +315,48 @@ mb_loop:
     jal     motion                      // then it is inter on the moved pixels
     li      mode, 1
 
+    .def colofs $t1             // block address terms: column (m), row half, half column
+    .def rowmsk $t2
+    .def rowofs $t3
+    .def hcol   $t4
+    .def plane  $t2             // chroma: 0 = U, 1 = V, then its offset
+    .def inter  $t1             // blk_have on: mode - 2, nonzero for inter
 blk_loop:
     slti    $t0, blk, 4
     beqz    $t0, blk_chroma
-    sll     $t1, m, 4
-    srl     $t2, blk, 1                 // luma: YBUF + (blk >> 1) * 8 rows + m * 16 + (blk & 1) * 8
-    subu    $t2, $zero, $t2
-    sll     $t3, ystr, 3
-    and     $t3, $t3, $t2
-    andi    $t4, blk, 1
-    sll     $t4, $t4, 3
-    addu    dst, $t1, $t3
-    addu    dst, dst, $t4
+    sll     colofs, m, 4
+    srl     rowmsk, blk, 1              // luma: YBUF + (blk >> 1) * 8 rows + m * 16 + (blk & 1) * 8
+    subu    rowmsk, $zero, rowmsk       // 0 or all ones
+    sll     rowofs, ystr, 3
+    and     rowofs, rowofs, rowmsk
+    andi    hcol, blk, 1
+    sll     hcol, hcol, 3
+    addu    dst, colofs, rowofs
+    addu    dst, dst, hcol
     addiu   dst, dst, YBUF
     b       blk_have
     move    stride, ystr
 blk_chroma:
-    sll     $t1, m, 3                   // chroma: UBUF / VBUF + m * 8
-    addiu   $t2, blk, -4
-    sll     $t2, $t2, 8
-    addu    dst, $t1, $t2
+    sll     colofs, m, 3                // chroma: UBUF / VBUF + m * 8
+    addiu   plane, blk, -4              // 0 = U, 1 = V (VBUF = UBUF + 0x100)
+    sll     plane, plane, 8
+    addu    dst, colofs, plane
     addiu   dst, dst, UBUF
     move    stride, cstr
 blk_have:
-    li      $t0, 0x20
+    li      $t0, 0x20                   // cbp bit of the block: 0x20 >> blk
     srlv    $t0, $t0, blk
     and     $t0, $t0, cbp
     bnez    $t0, blk_coded
-    addiu   $t1, mode, -2               // 0 = intra
-    bnez    $t1, blk_next               // inter, not coded: unchanged
+    addiu   inter, mode, -2             // 0 = intra
+    bnez    inter, blk_next             // inter, not coded: unchanged
     nop
     jal     fill128
     nop
     b       blk_next
     nop
 blk_coded:
-    bnez    $t1, blk_idct               // inter predicts from the pixels in place,
+    bnez    inter, blk_idct             // inter predicts from the pixels in place,
     nop
     jal     fill128                     // intra from 128
     nop
@@ -308,48 +371,60 @@ blk_idct:
     sqv     vzero[0], COEF + 0x50($zero)
     sqv     vzero[0], COEF + 0x60($zero)
     sqv     vzero[0], COEF + 0x70($zero)
-    lhu     $t0, 0(cur)                 // count (1..64), then {index, value}
+    .undef colofs
+    .undef rowmsk
+    .undef rowofs
+    .undef hcol
+    .undef plane
+    .undef inter
+    .def ncoef  $t0
+    .def cidx   $t1             // coefficient index, then its byte offset in COEF
+    .def cval   $t2
+    lhu     ncoef, 0(cur)               // count (1..64), then {index, value}
     addiu   cur, cur, 2
 scatter:
-    lhu     $t1, 0(cur)
-    lh      $t2, 2(cur)
+    lhu     cidx, 0(cur)
+    lh      cval, 2(cur)
     addiu   cur, cur, 4
-    sll     $t1, $t1, 1
-    addiu   $t0, $t0, -1
-    bnez    $t0, scatter
-    sh      $t2, COEF($t1)
-    lqv     $v1[0], COEF + 0x00($zero)
-    lqv     $v2[0], COEF + 0x10($zero)
-    lqv     $v3[0], COEF + 0x20($zero)
-    lqv     $v4[0], COEF + 0x30($zero)
-    lqv     $v5[0], COEF + 0x40($zero)
-    lqv     $v6[0], COEF + 0x50($zero)
-    lqv     $v7[0], COEF + 0x60($zero)
-    lqv     $v8[0], COEF + 0x70($zero)
-    PASS1   $v9, 0
-    PASS1   $v10, 1
-    PASS1   $v11, 2
-    PASS1   $v12, 3
-    PASS1   $v13, 4
-    PASS1   $v14, 5
-    PASS1   $v15, 6
-    PASS1   $v16, 7
-    PASS2   $v1, $v9
-    PASS2   $v2, $v10
-    PASS2   $v3, $v11
-    PASS2   $v4, $v12
-    PASS2   $v5, $v13
-    PASS2   $v6, $v14
-    PASS2   $v7, $v15
-    PASS2   $v8, $v16
-    PIXROW  $v1
-    PIXROW  $v2
-    PIXROW  $v3
-    PIXROW  $v4
-    PIXROW  $v5
-    PIXROW  $v6
-    PIXROW  $v7
-    PIXROW  $v8
+    sll     cidx, cidx, 1
+    addiu   ncoef, ncoef, -1
+    bnez    ncoef, scatter
+    sh      cval, COEF(cidx)
+    .undef ncoef
+    .undef cidx
+    .undef cval
+    lqv     vrow0[0], COEF + 0x00($zero)
+    lqv     vrow1[0], COEF + 0x10($zero)
+    lqv     vrow2[0], COEF + 0x20($zero)
+    lqv     vrow3[0], COEF + 0x30($zero)
+    lqv     vrow4[0], COEF + 0x40($zero)
+    lqv     vrow5[0], COEF + 0x50($zero)
+    lqv     vrow6[0], COEF + 0x60($zero)
+    lqv     vrow7[0], COEF + 0x70($zero)
+    PASS1   vtr0, 0
+    PASS1   vtr1, 1
+    PASS1   vtr2, 2
+    PASS1   vtr3, 3
+    PASS1   vtr4, 4
+    PASS1   vtr5, 5
+    PASS1   vtr6, 6
+    PASS1   vtr7, 7
+    PASS2   vrow0, vtr0
+    PASS2   vrow1, vtr1
+    PASS2   vrow2, vtr2
+    PASS2   vrow3, vtr3
+    PASS2   vrow4, vtr4
+    PASS2   vrow5, vtr5
+    PASS2   vrow6, vtr6
+    PASS2   vrow7, vtr7
+    PIXROW  vrow0
+    PIXROW  vrow1
+    PIXROW  vrow2
+    PIXROW  vrow3
+    PIXROW  vrow4
+    PIXROW  vrow5
+    PIXROW  vrow6
+    PIXROW  vrow7
 blk_next:
     addiu   blk, blk, 1
     slti    $t0, blk, 6
@@ -361,86 +436,120 @@ mb_next:
     nop
 
     jal     strip_addr
-    li      $sp, YROW                   // out: the current frame
+    li      rowtab, YROW                // out: the current frame
     jal     dma_wr
-    li      $t3, YBUF
+    li      dmem, YBUF
     jal     dma_wr
-    li      $t3, UBUF
+    li      dmem, UBUF
     jal     dma_wr
-    li      $t3, VBUF
+    li      dmem, VBUF
 
     // ---- colour conversion of the strip ----
-    lw      $fp, FB($zero)
-    beqz    $fp, strip_done
-    lw      $t1, FBSTRIDE($zero)
-    lqv     $v9[0], kc0($zero)
-    lqv     $v10[0], kc1($zero)
-    lqv     $v11[0], smask + 0x00($zero)
-    lqv     $v12[0], smask + 0x10($zero)
-    lqv     $v13[0], smask + 0x20($zero)
-    lqv     $v14[0], smask + 0x30($zero)
-    sll     $t2, n, 5                   // 32n bytes per output row; DMA 2 rows
-    addiu   ylen, $t2, -1
-    ori     ylen, ylen, 1 << 12
-    subu    $t3, $t1, $t2
+    // The strip's work registers are free here: clen, mode, cbp, m and the DMA convention
+    // registers take the roles below until strip_done.
+    .def fbptr  $fp             // RDRAM: framebuffer address of the next output row pair
+    .def fbstr  $t1             // FBSTRIDE (setup only)
+    .def orow   $t2             // 32n: bytes of one output row (setup only)
+    .def fbstep $a1             // 2 * FBSTRIDE
+    .def fblen  $a3             // SP_WR_LEN word: 2 rows of 32n, skipping the rest of the line
+    .def crows  $k0             // chroma rows left
+    .def obuf   $k1             // RGBBUF slot being filled (4 x 0x100, round robin)
+    .def yrow   $a0             // DMEM: luma row pair, chroma row of the group loop
+    .def urow   $a2
+    .def uptr   $t0             // group loop: U, V, luma, output of the row pair's top row
+    .def vptr   $t1
+    .def yptr   $t6
+    .def optr   $t7
+    .def y2ptr  $t2             // bottom row: luma, output
+    .def o2ptr  $t3
+    .def ngrp   $s6             // groups (8 chroma samples) left in the row
+    lw      fbptr, FB($zero)
+    beqz    fbptr, strip_done
+    lw      fbstr, FBSTRIDE($zero)
+    lqv     vkc0[0], kc0($zero)
+    lqv     vkc1[0], kc1($zero)
+    lqv     vsm0[0], smask + 0x00($zero)
+    lqv     vsm1[0], smask + 0x10($zero)
+    lqv     vsm2[0], smask + 0x20($zero)
+    lqv     vsm3[0], smask + 0x30($zero)
+    sll     orow, n, 5                  // 32n bytes per output row; DMA 2 rows
+    addiu   fblen, orow, -1
+    ori     fblen, fblen, 1 << 12
+    subu    $t3, fbstr, orow
     sll     $t3, $t3, 20
-    or      ylen, ylen, $t3
-    sll     $a1, $t1, 1
+    or      fblen, fblen, $t3
+    sll     fbstep, fbstr, 1
     sll     $t3, mx, 5
-    addu    $fp, $fp, $t3
-    li      mode, 8                     // chroma rows left
-    li      cbp, RGBBUF
-    li      $a0, YBUF
-    li      $a2, UBUF
+    addu    fbptr, fbptr, $t3
+    li      crows, 8
+    li      obuf, RGBBUF
+    li      yrow, YBUF
+    li      urow, UBUF
 c_row:
-    move    $t0, $a2
-    addiu   $t1, $a2, VBUF - UBUF
-    move    $t6, $a0
-    move    $t7, cbp
-    move    m, n
+    move    uptr, urow
+    addiu   vptr, urow, VBUF - UBUF
+    move    yptr, yrow
+    move    optr, obuf
+    move    ngrp, n
 c_grp:                                  // 8 chroma samples = 16 x 2 pixels
-    luv     $v8[0], 0($t0)
-    luv     $v15[0], 0($t1)
-    vsub    $v8, $v8, $v9[4]            // e7
-    vsub    $v15, $v15, $v9[4]          // d7
-    vmulf   $v1, $v15, $v9[0]
-    vadd    $v1, $v1, $v15              // rc
-    vmulf   $v2, $v8, $v9[1]
-    vmacf   $v2, $v15, $v9[2]           // gc
-    vmulf   $v3, $v8, $v9[3]
-    vadd    $v3, $v3, $v8               // bc
-    addu    $t2, $t6, ystr
-    sll     $t3, n, 5
-    addu    $t3, $t7, $t3
-    RGB8    0, $t6, 0, $t7, 0, 1, 2, 3
-    RGB8    8, $t6, 16, $t7, 4, 5, 6, 7
-    RGB8    0, $t2, 0, $t3, 0, 1, 2, 3
-    RGB8    8, $t2, 16, $t3, 4, 5, 6, 7
-    addiu   $t0, $t0, 8
-    addiu   $t1, $t1, 8
-    addiu   $t6, $t6, 16
-    addiu   m, m, -1
-    bnez    m, c_grp
-    addiu   $t7, $t7, 32
+    luv     ve7[0], 0(uptr)
+    luv     vd7[0], 0(vptr)
+    vsub    ve7, ve7, vkc0[4]           // e7
+    vsub    vd7, vd7, vkc0[4]           // d7
+    vmulf   vrc, vd7, vkc0[0]
+    vadd    vrc, vrc, vd7               // rc
+    vmulf   vgc, ve7, vkc0[1]
+    vmacf   vgc, vd7, vkc0[2]           // gc
+    vmulf   vbc, ve7, vkc0[3]
+    vadd    vbc, vbc, ve7               // bc
+    addu    y2ptr, yptr, ystr
+    sll     o2ptr, n, 5
+    addu    o2ptr, optr, o2ptr
+    RGB8    0, yptr, 0, optr, 0, 1, 2, 3
+    RGB8    8, yptr, 16, optr, 4, 5, 6, 7
+    RGB8    0, y2ptr, 0, o2ptr, 0, 1, 2, 3
+    RGB8    8, y2ptr, 16, o2ptr, 4, 5, 6, 7
+    addiu   uptr, uptr, 8
+    addiu   vptr, vptr, 8
+    addiu   yptr, yptr, 16
+    addiu   ngrp, ngrp, -1
+    bnez    ngrp, c_grp
+    addiu   optr, optr, 32
 c_dma:                                  // the buffer refilled next was queued 4 DMAs ago:
-    mfc0    $t9, SP_DMA_FULL            // done once the queue has room
-    bnez    $t9, c_dma
+    mfc0    dmastat, SP_DMA_FULL        // done once the queue has room
+    bnez    dmastat, c_dma
     nop
-    mtc0    cbp, SP_MEM_ADDR
-    mtc0    $fp, SP_DRAM_ADDR
-    mtc0    ylen, SP_WR_LEN
-    addu    $fp, $fp, $a1
-    addiu   cbp, cbp, 0x100
+    mtc0    obuf, SP_MEM_ADDR
+    mtc0    fbptr, SP_DRAM_ADDR
+    mtc0    fblen, SP_WR_LEN
+    addu    fbptr, fbptr, fbstep
+    addiu   obuf, obuf, 0x100
     li      $t2, RGBBUF + 0x400
-    bne     cbp, $t2, c_next
-    sll     $t2, ystr, 1
-    li      cbp, RGBBUF
+    bne     obuf, $t2, c_next
+    sll     $t2, ystr, 1                // luma advances two rows
+    li      obuf, RGBBUF
 c_next:
-    addu    $a0, $a0, $t2
-    addu    $a2, $a2, cstr
-    addiu   mode, mode, -1
-    bnez    mode, c_row
+    addu    yrow, yrow, $t2
+    addu    urow, urow, cstr
+    addiu   crows, crows, -1
+    bnez    crows, c_row
     nop
+    .undef fbptr
+    .undef fbstr
+    .undef orow
+    .undef fbstep
+    .undef fblen
+    .undef crows
+    .undef obuf
+    .undef yrow
+    .undef urow
+    .undef uptr
+    .undef vptr
+    .undef yptr
+    .undef optr
+    .undef y2ptr
+    .undef o2ptr
+    .undef ngrp
 strip_done:
     addu    mx, mx, n
     bne     mx, nmb, strip_loop
@@ -449,162 +558,199 @@ strip_done:
     nop
     break
 
-// RDRAM addresses of the strip in the planes whose row addresses are at $sp (YROW or
-// RYROW): $t4 Y, $t5 U, $a2 V. Then dma_rd / dma_wr take them in that order (each call
-// shifts: Y with ylen, then U and V with clen).
+// RDRAM addresses of the strip in the planes whose row addresses are at rowtab (YROW or
+// RYROW): dram0 Y, dram1 U, dram2 V, and dlen = ylen. Then dma_rd / dma_wr take them in
+// that order (each call shifts: Y with ylen, then U and V with clen).
+// Clobbers $t0.
 strip_addr:
-    lw      $t4, 0($sp)
+    lw      dram0, 0(rowtab)
     sll     $t0, mx, 4
-    addu    $t4, $t4, $t0
-    lw      $t5, 4($sp)
+    addu    dram0, dram0, $t0
+    lw      dram1, 4(rowtab)
     sll     $t0, mx, 3
-    addu    $t5, $t5, $t0
-    lw      $a2, 8($sp)
-    addu    $a2, $a2, $t0
-    move    $a1, ylen
+    addu    dram1, dram1, $t0
+    lw      dram2, 8(rowtab)
+    addu    dram2, dram2, $t0
+    move    dlen, ylen
     jr      $ra
     nop
 
-// DMEM $t3 <-> RDRAM $t4 with length word $a1, then shift ($t4 <- $t5 <- $a2, $a1 <- clen).
+// DMEM dmem <-> RDRAM dram0 with length word dlen, then shift
+// (dram0 <- dram1 <- dram2, dlen <- clen). Waits only for room in the DMA queue.
 dma_rd:
-    mfc0    $t9, SP_DMA_FULL
-    bnez    $t9, dma_rd
+    mfc0    dmastat, SP_DMA_FULL
+    bnez    dmastat, dma_rd
     nop
-    mtc0    $t3, SP_MEM_ADDR
-    mtc0    $t4, SP_DRAM_ADDR
+    mtc0    dmem, SP_MEM_ADDR
+    mtc0    dram0, SP_DRAM_ADDR
     b       dma_shift
-    mtc0    $a1, SP_RD_LEN
+    mtc0    dlen, SP_RD_LEN
 dma_wr:
-    mfc0    $t9, SP_DMA_FULL
-    bnez    $t9, dma_wr
+    mfc0    dmastat, SP_DMA_FULL
+    bnez    dmastat, dma_wr
     nop
-    mtc0    $t3, SP_MEM_ADDR
-    mtc0    $t4, SP_DRAM_ADDR
-    mtc0    $a1, SP_WR_LEN
+    mtc0    dmem, SP_MEM_ADDR
+    mtc0    dram0, SP_DRAM_ADDR
+    mtc0    dlen, SP_WR_LEN
 dma_shift:
-    move    $t4, $t5
-    move    $t5, $a2
+    move    dram0, dram1
+    move    dram1, dram2
     jr      $ra
-    move    $a1, clen
+    move    dlen, clen
 
+// Waits until every queued DMA is done.
 dma_wait:
-    mfc0    $t9, SP_DMA_BUSY
-    bnez    $t9, dma_wait
+    mfc0    dmastat, SP_DMA_BUSY
+    bnez    dmastat, dma_wait
     nop
     jr      $ra
     nop
 
-// Guarantees WNEED bytes of work list at cur (reloads the window from cur's RDRAM address).
+// Guarantees WNEED bytes of work list at cur (reloads the window from cur's RDRAM address,
+// rounded down to 8 bytes, and waits for it). Clobbers $t0-$t3.
+    .def wrd    $t1             // RDRAM address of cur
+    .def walign $t2             // its misalignment, the offset of cur in the new window
 ensure:
     addiu   $t0, cur, WNEED
     sltu    $t0, wend, $t0
     beqz    $t0, ensure_ok
-    addiu   $t1, cur, -WBUF
-    addu    $t1, $t1, wbase
-    andi    $t2, $t1, 7
-    subu    wbase, $t1, $t2
-    addiu   cur, $t2, WBUF
+    addiu   wrd, cur, -WBUF
+    addu    wrd, wrd, wbase
+    andi    walign, wrd, 7
+    subu    wbase, wrd, walign
+    addiu   cur, walign, WBUF
     li      wend, WBUF + WCHUNK
 ensure_dma:
-    mfc0    $t9, SP_DMA_FULL
-    bnez    $t9, ensure_dma
+    mfc0    dmastat, SP_DMA_FULL
+    bnez    dmastat, ensure_dma
     li      $t3, WBUF
     mtc0    $t3, SP_MEM_ADDR
     mtc0    wbase, SP_DRAM_ADDR
     li      $t3, WCHUNK - 1
     mtc0    $t3, SP_RD_LEN
 ensure_wait:
-    mfc0    $t9, SP_DMA_BUSY
-    bnez    $t9, ensure_wait
+    mfc0    dmastat, SP_DMA_BUSY
+    bnez    dmastat, ensure_wait
     nop
 ensure_ok:
     jr      $ra
     nop
+    .undef wrd
+    .undef walign
 
 // Motion macroblock m: reads the two source offsets at cur, DMAs the aligned windows and
 // copies the 16x16 luma and 8x8 U / V source blocks over the strip's pixels.
+// Clobbers $t0-$t4, $a0, $a1, $at, $v1.
+    .def mret   $at             // return address (motion calls mc_dma)
+    .def msrc   $t0             // mc_dma: RDRAM source, DMEM destination, length word
+    .def mdst   $t4
+    .def mlen   $t3
+    .def coff   $t1             // chroma source offset (from RUBASE / RVBASE)
+    .def mwidth $t2             // luma, then chroma width in bytes
+    .def ywin   $a0             // offset of the source block in its aligned window: luma,
+    .def cwin   $a1             // chroma (the same for U and V)
+    .def mrow   $v1
 motion:
-    move    $at, $ra
-    lw      $t0, 0(cur)                 // luma offset (cur is only 2-aligned: DMEM allows it)
-    lw      $t1, 4(cur)                 // chroma offset
+    move    mret, $ra
+    lw      msrc, 0(cur)                // luma offset (cur is only 2-aligned: DMEM allows it)
+    lw      coff, 4(cur)                // chroma offset
     addiu   cur, cur, 8
-    lw      $t2, WIDTH($zero)
-    lw      $t3, RYBASE($zero)
-    addu    $t0, $t0, $t3
-    andi    $a0, $t0, 7                 // luma window offset
-    subu    $t0, $t0, $a0
-    addiu   $t3, $t2, -24               // 16 rows of 24, skipping the rest of the line
-    sll     $t3, $t3, 20
-    ori     $t3, $t3, (15 << 12) + 23
-    li      $t4, MCY
+    lw      mwidth, WIDTH($zero)
+    lw      mlen, RYBASE($zero)
+    addu    msrc, msrc, mlen
+    andi    ywin, msrc, 7
+    subu    msrc, msrc, ywin
+    addiu   mlen, mwidth, -24           // 16 rows of 24, skipping the rest of the line
+    sll     mlen, mlen, 20
+    ori     mlen, mlen, (15 << 12) + 23
+    li      mdst, MCY
     jal     mc_dma
     nop
-    lw      $t3, RUBASE($zero)
-    addu    $t0, $t1, $t3
-    andi    $a1, $t0, 7                 // chroma window offset (same for U and V)
-    subu    $t0, $t0, $a1
-    srl     $t2, $t2, 1
-    addiu   $t3, $t2, -16               // 8 rows of 16
-    sll     $t3, $t3, 20
-    ori     $t3, $t3, (7 << 12) + 15
+    lw      mlen, RUBASE($zero)
+    addu    msrc, coff, mlen
+    andi    cwin, msrc, 7
+    subu    msrc, msrc, cwin
+    srl     mwidth, mwidth, 1
+    addiu   mlen, mwidth, -16           // 8 rows of 16
+    sll     mlen, mlen, 20
+    ori     mlen, mlen, (7 << 12) + 15
     jal     mc_dma
-    li      $t4, MCU
-    lw      $t4, RVBASE($zero)
-    addu    $t0, $t1, $t4
-    subu    $t0, $t0, $a1
+    li      mdst, MCU
+    lw      mdst, RVBASE($zero)
+    addu    msrc, coff, mdst
+    subu    msrc, msrc, cwin
     jal     mc_dma
-    li      $t4, MCV
+    li      mdst, MCV
+    .undef mwidth
+    .def mout   $t2             // copy loops: strip destination, window source, rows left
+    .def min    $t0
+    .def mcnt   $t4
 mc_wait:
-    mfc0    $t9, SP_DMA_BUSY
-    bnez    $t9, mc_wait
-    sll     $t2, m, 4
-    addiu   $t2, $t2, YBUF              // luma rows -> YBUF + 16m, stride ystr
-    addiu   $t0, $a0, MCY
-    li      $t4, 16
+    mfc0    dmastat, SP_DMA_BUSY
+    bnez    dmastat, mc_wait
+    sll     mout, m, 4
+    addiu   mout, mout, YBUF            // luma rows -> YBUF + 16m, stride ystr
+    addiu   min, ywin, MCY
+    li      mcnt, 16
 mc_y:
-    lqv     $v1[0], 0($t0)
-    lrv     $v1[0], 16($t0)
-    sqv     $v1[0], 0($t2)
-    addiu   $t0, $t0, 24
-    addiu   $t4, $t4, -1
-    bnez    $t4, mc_y
-    addu    $t2, $t2, ystr
-    sll     $t2, m, 3
-    addiu   $t2, $t2, UBUF              // chroma rows -> UBUF / VBUF + 8m, stride cstr
-    addiu   $t0, $a1, MCU
-    li      $t4, 8
+    lqv     mrow[0], 0(min)             // 16 bytes from any address: lqv + lrv
+    lrv     mrow[0], 16(min)
+    sqv     mrow[0], 0(mout)
+    addiu   min, min, 24
+    addiu   mcnt, mcnt, -1
+    bnez    mcnt, mc_y
+    addu    mout, mout, ystr
+    sll     mout, m, 3
+    addiu   mout, mout, UBUF            // chroma rows -> UBUF / VBUF + 8m, stride cstr
+    addiu   min, cwin, MCU
+    li      mcnt, 8
 mc_c:
-    lqv     $v1[0], 0($t0)
-    lrv     $v1[0], 16($t0)
-    sdv     $v1[0], 0($t2)
-    lqv     $v1[0], MCV - MCU($t0)
-    lrv     $v1[0], MCV - MCU + 16($t0)
-    sdv     $v1[0], VBUF - UBUF($t2)
-    addiu   $t0, $t0, 16
-    addiu   $t4, $t4, -1
-    bnez    $t4, mc_c
-    addu    $t2, $t2, cstr
-    jr      $at
+    lqv     mrow[0], 0(min)
+    lrv     mrow[0], 16(min)
+    sdv     mrow[0], 0(mout)
+    lqv     mrow[0], MCV - MCU(min)
+    lrv     mrow[0], MCV - MCU + 16(min)
+    sdv     mrow[0], VBUF - UBUF(mout)
+    addiu   min, min, 16
+    addiu   mcnt, mcnt, -1
+    bnez    mcnt, mc_c
+    addu    mout, mout, cstr
+    jr      mret
     nop
+    .undef mout
+    .undef min
+    .undef mcnt
 
-// DMEM $t4 <- RDRAM $t0, length word $t3.
+// DMEM mdst <- RDRAM msrc, length word mlen. Waits only for room in the DMA queue.
 mc_dma:
-    mfc0    $t9, SP_DMA_FULL
-    bnez    $t9, mc_dma
+    mfc0    dmastat, SP_DMA_FULL
+    bnez    dmastat, mc_dma
     nop
-    mtc0    $t4, SP_MEM_ADDR
-    mtc0    $t0, SP_DRAM_ADDR
+    mtc0    mdst, SP_MEM_ADDR
+    mtc0    msrc, SP_DRAM_ADDR
     jr      $ra
-    mtc0    $t3, SP_RD_LEN
+    mtc0    mlen, SP_RD_LEN
+    .undef mret
+    .undef msrc
+    .undef mdst
+    .undef mlen
+    .undef coff
+    .undef ywin
+    .undef cwin
+    .undef mrow
 
-// 8 rows of 128 at dst (keeps dst / stride).
+// 8 rows of 128 at dst (keeps dst / stride). Clobbers $t4, $t5.
+    .def frow   $t5
+    .def fcnt   $t4
 fill128:
-    move    $t5, dst
-    li      $t4, 8
+    move    frow, dst
+    li      fcnt, 8
 fill_row:
-    suv     vfill[0], 0($t5)
-    addiu   $t4, $t4, -1
-    bnez    $t4, fill_row
-    addu    $t5, $t5, stride
+    suv     vfill[0], 0(frow)
+    addiu   fcnt, fcnt, -1
+    bnez    fcnt, fill_row
+    addu    frow, frow, stride
     jr      $ra
     nop
+    .undef frow
+    .undef fcnt

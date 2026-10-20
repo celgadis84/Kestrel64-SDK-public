@@ -73,7 +73,8 @@ int main(void) {
   float anim = 0, yaw = 0.9f;
   u32 cpu_us = 0, rsp_us = 0, rdp_clk = 0, tris = 0, pose_us = 0, prep_us = 0, frame_us = 0;
   u32 tf = k64_count();
-  k64_mat4_lookat(&view, (k64_vec3_t){ 0, dist * (900.f / 10500.f), dist }, (k64_vec3_t){ 0, -300, 0 }, (k64_vec3_t){ 0, 1, 0 });
+  k64_mat4_lookat(&view, (k64_vec3_t){0, dist * (900.f / 10500.f), dist}, (k64_vec3_t){0, -300, 0},
+                  (k64_vec3_t){0, 1, 0});
   k64_mat4_mul(&viewproj, &proj, &view);
   prepare(&m, &viewproj, anim, yaw, &pose_us, &prep_us);
   u32 lod = 0;
@@ -105,7 +106,8 @@ int main(void) {
     u32 held = k64_pads[0].held;
     if (held & K64_PAD_CUP) dist = dist > 6000.f ? dist - 150.f : dist;
     if (held & K64_PAD_CDOWN) dist = dist < 28000.f ? dist + 150.f : dist;
-    k64_mat4_lookat(&view, (k64_vec3_t){ 0, dist * (900.f / 10500.f), dist }, (k64_vec3_t){ 0, -300, 0 }, (k64_vec3_t){ 0, 1, 0 });
+    k64_mat4_lookat(&view, (k64_vec3_t){0, dist * (900.f / 10500.f), dist}, (k64_vec3_t){0, -300, 0},
+                    (k64_vec3_t){0, 1, 0});
     k64_mat4_mul(&viewproj, &proj, &view);
     prepare(&m, &viewproj, anim, yaw, &pose_us, &prep_us);
     u32 next_lod = lod_mode >= 0 ? (u32)lod_mode : dist > 25500.f ? 3 : dist > 21000.f ? 2 : dist > 14000.f ? 1 : 0;
@@ -128,8 +130,9 @@ int main(void) {
     k64_display_show(fb);
     lod = next_lod;
     if ((frame & 63) == 63)
-      k64_printf("[10] frame %u tris %u cpu %u us (pose %u prepare %u, under the rsp) rsp %u us rdp %u clk frame %u us\n",
-                 frame, tris, cpu_us, pose_us, prep_us, rsp_us, rdp_clk, frame_us);
+      k64_printf(
+          "[10] frame %u tris %u cpu %u us (pose %u prepare %u, under the rsp) rsp %u us rdp %u clk frame %u us\n",
+          frame, tris, cpu_us, pose_us, prep_us, rsp_us, rdp_clk, frame_us);
     if (k64_pads[0].pressed & K64_PAD_A) animate = !animate;
     if (k64_pads[0].pressed & K64_PAD_B) turn = !turn;
     if (k64_pads[0].pressed & K64_PAD_R) lod_mode = lod_mode >= 3 ? -1 : lod_mode + 1;

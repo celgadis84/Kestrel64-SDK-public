@@ -5,4 +5,5 @@
 // for ~7.5 s (START, A or B skips), and gives every memory zone back when it returns.
 #pragma once
 
+// Called by the runtime before main (blocking). Not linked into NO_LOGO ROMs.
 void k64_logo_play(void);

@@ -24,7 +24,14 @@ static u16 *zbuf;
 static k64_mat4_t mvp;                      // world (model units) -> clip
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[21_particles] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                                 \
+  do {                                                \
+    if (!(c)) {                                       \
+      fails++;                                        \
+      k64_printf("[21_particles] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                               \
+    }                                                 \
+  } while (0)
 
 static void set_camera(k64_vec3_t eye, k64_vec3_t at) {
   k64_mat4_t proj, view, vpm, sc;
@@ -118,7 +125,8 @@ static void self_test(const k64_surface_t *fb) {
     project(i, &sx, &sy, &r);
     const k64_particle_t *p = &blk->p[i];
     u16 c = (u16)k64_rgba16(p->r, p->g, p->b, 255);
-    CHECK(px(fb, sx > 0 ? sx : 0, sy) == c, "p%u center (%d,%d) %04x vs %04x", i, (int)sx, (int)sy, px(fb, sx > 0 ? sx : 0, sy), c);
+    CHECK(px(fb, sx > 0 ? sx : 0, sy) == c, "p%u center (%d,%d) %04x vs %04x", i, (int)sx, (int)sy,
+          px(fb, sx > 0 ? sx : 0, sy), c);
     CHECK(px(fb, sx + r - 1.5f, sy) == c && px(fb, sx, sy - r + 1.5f) == c, "p%u inside r=%d", i, (int)r);
     CHECK(px(fb, sx + r + 1.5f, sy) == bg && px(fb, sx, sy + r + 1.5f) == bg, "p%u outside r=%d", i, (int)r);
   }
@@ -189,8 +197,10 @@ static void self_test(const k64_surface_t *fb) {
   k64_rdp_set_other_modes(K64_OM_1C_OPAQUE | K64_OM_ZBUF);
   k64_rdp_set_combine(K64_CC_SHADE);
   k64_vec3_t eye = { 0, 0, 10 * UNIT };
-  k64_kgfx_billboard_y(tree_v[0], (k64_vec3_t){ -3 * UNIT, -1 * UNIT, 0 }, 0.5f * UNIT, 2 * UNIT, eye, 0xF80000FF, 0, 0, 0, 0);
-  k64_kgfx_billboard_y(tree_v[1], (k64_vec3_t){ 4 * UNIT, -2 * UNIT, -4 * UNIT }, 0.5f * UNIT, 2 * UNIT, eye, 0x00F800FF, 0, 0, 0, 0);
+  k64_kgfx_billboard_y(tree_v[0], (k64_vec3_t){-3 * UNIT, -1 * UNIT, 0}, 0.5f * UNIT, 2 * UNIT, eye, 0xF80000FF, 0, 0,
+                       0, 0);
+  k64_kgfx_billboard_y(tree_v[1], (k64_vec3_t){4 * UNIT, -2 * UNIT, -4 * UNIT}, 0.5f * UNIT, 2 * UNIT, eye, 0x00F800FF,
+                       0, 0, 0, 0);
   k64_dcache_writeback(tree_v, sizeof tree_v);
   k64_kgfx_list_t l;
   k64_kgfx_begin(&l, list_buf, K64_ARRAY_LEN(list_buf));

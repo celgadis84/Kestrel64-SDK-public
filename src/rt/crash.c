@@ -172,7 +172,8 @@ static const char *exc_name(u32 code) {
   return n[code & 31] ? n[code & 31] : "?";
 }
 
-static void report(const char *title, const k64_exc_frame_t *f, u32 pc, u32 sp, u32 ra, int skip) {
+static __attribute__((noreturn)) void report(const char *title, const k64_exc_frame_t *f, u32 pc, u32 sp, u32 ra,
+                                             int skip) {
   static int depth;
   if (depth++) for (;;) {}              // crashed while reporting
   k64_set_status(K64_C0_READ(12) & ~1u);

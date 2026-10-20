@@ -218,10 +218,11 @@ int main(void) {
 
     if (sweep && ++sweep_t == SWEEP_FRAMES) {
       sweep_t = 0;
-      k64_printf("[16] %s rows %u copies %u tris %u drawn %u  frame %u us  cpu %u rsp %u rdp %u us  %u ktris/s  rsp %u ns/tri\n",
-                 shape_name[shape], rows, copies, sent, shown.drawn, shown.frame_us, shown.cpu_us,
-                 shown.rsp_us, shown.rdp_us, (u32)((u64)shown.drawn * 1000 / (shown.frame_us ? shown.frame_us : 1)),
-                 shown.rsp_us * 1000 / sent);
+      k64_printf(
+          "[16] %s rows %u copies %u tris %u drawn %u  frame %u us  cpu %u rsp %u rdp %u us  %u ktris/s  rsp %u "
+          "ns/tri\n",
+          shape_name[shape], rows, copies, sent, shown.drawn, shown.frame_us, shown.cpu_us, shown.rsp_us, shown.rdp_us,
+          (u32)((u64)shown.drawn * 1000 / (shown.frame_us ? shown.frame_us : 1)), shown.rsp_us * 1000 / sent);
       if (shown.frame_us > 100000 || copies == MAX_COPIES) {
         sweep = false;
         k64_printf("[16] sweep done\n");

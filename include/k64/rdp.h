@@ -68,7 +68,8 @@ enum { K64_BL_B_1MA = 0, K64_BL_B_MEM = 1, K64_BL_B_ONE = 2, K64_BL_B_ZERO = 3 }
 #define K64_OM_COPY        (K64_OM_CYCLE_COPY)
 #define K64_OM_COPY_ALPHA  (K64_OM_CYCLE_COPY | K64_OM_ALPHA_COMPARE)   // drop alpha=0 texels
 // 1-cycle opaque, pass-through blender (pixel*1 + mem*0)
-#define K64_OM_1C_OPAQUE   (K64_OM_BASE | K64_OM_CYCLE_1 | K64_OM_BLEND(K64_BL_IN, K64_BL_A_IN, K64_BL_IN, K64_BL_B_1MA, 0,0,0,0))
+#define K64_OM_1C_OPAQUE \
+  (K64_OM_BASE | K64_OM_CYCLE_1 | K64_OM_BLEND(K64_BL_IN, K64_BL_A_IN, K64_BL_IN, K64_BL_B_1MA, 0, 0, 0, 0))
 // 1-cycle alpha blend: pixel*a + mem*(1-a)
 #define K64_OM_1C_XLU      (K64_OM_BASE | K64_OM_CYCLE_1 | K64_OM_FORCE_BLEND | K64_OM_IMAGE_READ | \
                             K64_OM_BLEND(K64_BL_IN, K64_BL_A_IN, K64_BL_MEM, K64_BL_B_1MA, 0,0,0,0))
@@ -76,7 +77,9 @@ enum { K64_BL_B_1MA = 0, K64_BL_B_MEM = 1, K64_BL_B_ONE = 2, K64_BL_B_ZERO = 3 }
 // 2-cycle fog by shade alpha (kgfx FOG writes the fog factor into the vertex alpha): cycle 0
 // mixes FOG_COLOR in, fog * a + pixel * (1 - a); cycle 1 passes it through, opaque. Pair it
 // with a 2-cycle combine whose cycle 1 is COMB (K64_CC_2C_*).
-#define K64_OM_2C_FOG_SHADE (K64_OM_BASE | K64_OM_CYCLE_2 |                             K64_OM_BLEND(K64_BL_FOG, K64_BL_A_SHADE, K64_BL_IN, K64_BL_B_1MA,                                          K64_BL_IN, K64_BL_A_IN, K64_BL_IN, K64_BL_B_1MA))
+#define K64_OM_2C_FOG_SHADE (K64_OM_BASE | K64_OM_CYCLE_2 | \
+                             K64_OM_BLEND(K64_BL_FOG, K64_BL_A_SHADE, K64_BL_IN, K64_BL_B_1MA, \
+                                          K64_BL_IN, K64_BL_A_IN, K64_BL_IN, K64_BL_B_1MA))
 
 // ---- color combiner ----------------------------------------------------------------
 // RGB  A: 0 comb,1 tex0,2 tex1,3 prim,4 shade,5 env,6 one,7 noise,8 zero
@@ -112,17 +115,25 @@ enum { CA_COMB = 0, CA_TEX0 = 1, CA_TEX1 = 2, CA_PRIM = 3, CA_SHADE = 4, CA_ENV 
 #define K64_CC_TEX_PRIM     K64_CC_1CYC(CC_TEX0,CC_ZERO,CC_PRIM,CC_D_ZERO,  CA_TEX0,CA_ZERO,CA_PRIM,CA_ZERO)
 // 2-cycle: cycle 0 = the equation, cycle 1 = COMB. Alpha leaves the shade out (with fog it
 // holds the fog factor): texel alpha, or one.
-#define K64_CC_2C_SHADE     K64_CC(CC_ZERO,CC_ZERO,CC_C_ZERO,CC_SHADE, CA_ZERO,CA_ZERO,CA_ZERO,CA_ONE,                                    CC_ZERO,CC_ZERO,CC_C_ZERO,CC_COMB,  CA_ZERO,CA_ZERO,CA_ZERO,CA_COMB)
-#define K64_CC_2C_TEX_SHADE K64_CC(CC_TEX0,CC_ZERO,CC_SHADE,CC_D_ZERO, CA_ZERO,CA_ZERO,CA_ZERO,CA_TEX0,                                    CC_ZERO,CC_ZERO,CC_C_ZERO,CC_COMB,  CA_ZERO,CA_ZERO,CA_ZERO,CA_COMB)
+#define K64_CC_2C_SHADE     K64_CC(CC_ZERO,CC_ZERO,CC_C_ZERO,CC_SHADE, CA_ZERO,CA_ZERO,CA_ZERO,CA_ONE, \
+                                   CC_ZERO,CC_ZERO,CC_C_ZERO,CC_COMB,  CA_ZERO,CA_ZERO,CA_ZERO,CA_COMB)
+#define K64_CC_2C_TEX_SHADE K64_CC(CC_TEX0,CC_ZERO,CC_SHADE,CC_D_ZERO, CA_ZERO,CA_ZERO,CA_ZERO,CA_TEX0, \
+                                   CC_ZERO,CC_ZERO,CC_C_ZERO,CC_COMB,  CA_ZERO,CA_ZERO,CA_ZERO,CA_COMB)
 
 // ---- raw command encoders (return the 64-bit command words) ------------------------
+// Nothing is written: pass the result to k64_rdp_put, or store it in a kgfx RDP block.
+// Addresses are physical (K64_PHYS); colors are RGBA8888, except FILL_COLOR, which is the
+// raw framebuffer pattern (two RGBA5551 pixels at 16bpp).
 #define K64_RDP_OP(op)          ((u64)(op) << 56)
 #define K64_FX2(v)              ((u32)(v) & 0xFFF)          // 10.2 coordinate field
 
+// FULL: wait for the whole pipeline and raise the DP interrupt; PIPE / TILE / LOAD: see above.
 K64_INLINE u64 k64_rdpc_sync_full(void)  { return K64_RDP_OP(0x29); }
 K64_INLINE u64 k64_rdpc_sync_pipe(void)  { return K64_RDP_OP(0x27); }
 K64_INLINE u64 k64_rdpc_sync_tile(void)  { return K64_RDP_OP(0x28); }
 K64_INLINE u64 k64_rdpc_sync_load(void)  { return K64_RDP_OP(0x26); }
+// width in pixels (texels for TEX_IMAGE); color / Z images need 64-byte alignment for best
+// bursts (8 minimum).
 K64_INLINE u64 k64_rdpc_color_image(u32 fmt, u32 siz, u32 width, u32 phys) {
   return K64_RDP_OP(0x3F) | ((u64)fmt << 53) | ((u64)siz << 51) | ((u64)(width - 1) << 32) | (phys & 0x3FFFFFF);
 }
@@ -139,6 +150,7 @@ K64_INLINE u64 k64_rdpc_combine(u64 cc)     { return K64_RDP_OP(0x3C) | (cc & 0x
 K64_INLINE u64 k64_rdpc_fill_color(u32 c)   { return K64_RDP_OP(0x37) | c; }
 K64_INLINE u64 k64_rdpc_fog_color(u32 c)    { return K64_RDP_OP(0x38) | c; }
 K64_INLINE u64 k64_rdpc_blend_color(u32 c)  { return K64_RDP_OP(0x39) | c; }
+// minlvl / lodfrac: the LOD clamp and the PRIM_LOD_FRAC combiner input.
 K64_INLINE u64 k64_rdpc_prim_color(u32 c, u8 minlvl, u8 lodfrac) {
   return K64_RDP_OP(0x3A) | ((u64)(minlvl & 31) << 40) | ((u64)lodfrac << 32) | c;
 }
@@ -149,6 +161,7 @@ K64_INLINE u64 k64_rdpc_set_convert(int k0, int k1, int k2, int k3, int k4, int 
   return K64_RDP_OP(0x2C) | ((u64)(k0 & 0x1FF) << 45) | ((u64)(k1 & 0x1FF) << 36) | ((u64)(k2 & 0x1FF) << 27)
        | ((u64)(k3 & 0x1FF) << 18) | ((u64)(k4 & 0x1FF) << 9) | (u64)(k5 & 0x1FF);
 }
+// Depth for primitives with K64_OM_Z_SOURCE_PRIM (rectangles): z 0..0x7FFF, dz its slope.
 K64_INLINE u64 k64_rdpc_prim_depth(u16 z, u16 dz) { return K64_RDP_OP(0x2E) | ((u32)z << 16) | dz; }
 // Rectangle: (x0,y0) top-left, (x1,y1) bottom-right, 10.2. Fill/copy mode treat x1,y1 as
 // inclusive pixels; 1/2-cycle modes exclusive.
@@ -158,22 +171,28 @@ K64_INLINE u64 k64_rdpc_fill_rect(u32 x0, u32 y0, u32 x1, u32 y1) {
 // tile descriptor: line/tmem in 64-bit words
 K64_INLINE u64 k64_rdpc_set_tile(u32 fmt, u32 siz, u32 line, u32 tmem, u32 tile, u32 pal,
                                  u32 ct, u32 mt, u32 maskt, u32 shiftt, u32 cs, u32 ms, u32 masks, u32 shifts) {
-  return K64_RDP_OP(0x35) | ((u64)fmt << 53) | ((u64)siz << 51) | ((u64)(line & 0x1FF) << 41) | ((u64)(tmem & 0x1FF) << 32)
-       | ((u64)tile << 24) | ((u64)pal << 20) | ((u64)ct << 19) | ((u64)mt << 18) | ((u64)maskt << 14) | ((u64)shiftt << 10)
-       | ((u64)cs << 9) | ((u64)ms << 8) | ((u64)masks << 4) | shifts;
+  return K64_RDP_OP(0x35) | ((u64)fmt << 53) | ((u64)siz << 51) | ((u64)(line & 0x1FF) << 41)
+         | ((u64)(tmem & 0x1FF) << 32) | ((u64)tile << 24) | ((u64)pal << 20) | ((u64)ct << 19) | ((u64)mt << 18)
+         | ((u64)maskt << 14) | ((u64)shiftt << 10) | ((u64)cs << 9) | ((u64)ms << 8) | ((u64)masks << 4) | shifts;
 }
+// LOAD_TILE / SET_TILE_SIZE / LOAD_TLUT share this layout: s, t in 10.2 texels.
 K64_INLINE u64 k64_rdpc_tile_cmd(u32 op, u32 tile, u32 s0, u32 t0, u32 s1, u32 t1) {
-  return K64_RDP_OP(op) | ((u64)K64_FX2(s0) << 44) | ((u64)K64_FX2(t0) << 32) | ((u64)tile << 24) | (K64_FX2(s1) << 12) | K64_FX2(t1);
+  return K64_RDP_OP(op) | ((u64)K64_FX2(s0) << 44) | ((u64)K64_FX2(t0) << 32) | ((u64)tile << 24) | (K64_FX2(s1) << 12)
+         | K64_FX2(t1);
 }
 #define k64_rdpc_load_tile(tile, s0, t0, s1, t1)  k64_rdpc_tile_cmd(0x34, tile, s0, t0, s1, t1)
 #define k64_rdpc_tile_size(tile, s0, t0, s1, t1)  k64_rdpc_tile_cmd(0x32, tile, s0, t0, s1, t1)
 #define k64_rdpc_load_tlut(tile, i0, i1)          k64_rdpc_tile_cmd(0x30, tile, (i0) << 2, 0, (i1) << 2, 0)
+// texels (<= 2048) in one go; dxt = 2048 / (line width in 64-bit words), rounded up, so t
+// advances once per line (0: the caller swaps lines itself).
 K64_INLINE u64 k64_rdpc_load_block(u32 tile, u32 s0, u32 t0, u32 texels, u32 dxt) {
-  return K64_RDP_OP(0x33) | ((u64)s0 << 44) | ((u64)t0 << 32) | ((u64)tile << 24) | ((u64)(texels - 1) << 12) | (dxt & 0xFFF);
+  return K64_RDP_OP(0x33) | ((u64)s0 << 44) | ((u64)t0 << 32) | ((u64)tile << 24) | ((u64)(texels - 1) << 12)
+         | (dxt & 0xFFF);
 }
 // Texture rectangle: coords 10.2; s,t s10.5; dsdx,dtdy s5.10. Two words.
 K64_INLINE u64 k64_rdpc_tex_rect0(u32 tile, u32 x0, u32 y0, u32 x1, u32 y1) {
-  return K64_RDP_OP(0x24) | ((u64)K64_FX2(x1) << 44) | ((u64)K64_FX2(y1) << 32) | ((u64)tile << 24) | (K64_FX2(x0) << 12) | K64_FX2(y0);
+  return K64_RDP_OP(0x24) | ((u64)K64_FX2(x1) << 44) | ((u64)K64_FX2(y1) << 32) | ((u64)tile << 24)
+         | (K64_FX2(x0) << 12) | K64_FX2(y0);
 }
 K64_INLINE u64 k64_rdpc_tex_rect1(s16 s, s16 t, s16 dsdx, s16 dtdy) {
   return ((u64)(u16)s << 48) | ((u64)(u16)t << 32) | ((u32)(u16)dsdx << 16) | (u16)dtdy;
@@ -189,6 +208,8 @@ typedef struct {
 } k64_rdp_stream_t;
 extern k64_rdp_stream_t k64_rdp;
 
+// Allocates the ring (K64_RDP_RING_BYTES, K64_ZONE_HEAP) and resets the stream and the
+// tracked state.
 void k64_rdp_init(void);
 // Same, with the ring in caller memory (K64_RDP_RING_BYTES, 8-byte aligned; 64 is best).
 #define K64_RDP_RING_BYTES 65536
@@ -201,7 +222,7 @@ void k64_rdp_ring_import(const k64_rdp_ring_t *r);  // continues after the other
 void k64_rdp_overflow(void);                 // current block full: flush + move to next
 void k64_rdp_more(u32 n);                    // make room for n words past the cursor
 void k64_rdp_flush(void);                    // make everything written so far visible to RDP
-bool k64_rdp_busy(void);
+bool k64_rdp_busy(void);                     // the RDP has work queued or in its pipeline
 void k64_rdp_wait_idle(void);                // emits SYNC_FULL, flushes and waits for DP intr
 u32  k64_rdp_clock(void);                    // DPC_CLOCK (GCLK counter, 24-bit)
 
@@ -215,6 +236,7 @@ K64_INLINE void k64_rdp_put(u64 w) {
   if (K64_UNLIKELY(k64_rdp.cur >= k64_rdp.lim)) k64_rdp_more(1);
   *k64_rdp.cur++ = w;
 }
+// Two words (a two-word command, or two commands) with one room check.
 K64_INLINE void k64_rdp_put2(u64 a, u64 b) {
   if (K64_UNLIKELY(k64_rdp.cur + 2 > k64_rdp.lim)) k64_rdp_more(2);
   k64_rdp.cur[0] = a; k64_rdp.cur[1] = b; k64_rdp.cur += 2;
@@ -245,8 +267,14 @@ typedef struct {
 } k64_rdp_state_t;
 extern k64_rdp_state_t k64_rdps;
 
+// SYNC_PIPE if a primitive went out since the last one. Each setter below calls it first and
+// skips the command when the value is already set.
 K64_INLINE void k64_rdp_pipe_guard(void) {
-  if (k64_rdps.prim_pending) { k64_rdp_put(k64_rdpc_sync_pipe()); k64_rdps.prim_pending = false; k64_rdps.stat_syncs_pipe++; }
+  if (k64_rdps.prim_pending) {
+    k64_rdp_put(k64_rdpc_sync_pipe());
+    k64_rdps.prim_pending = false;
+    k64_rdps.stat_syncs_pipe++;
+  }
 }
 K64_INLINE void k64_rdp_set_other_modes(u64 om) {
   if (om == k64_rdps.other_modes) return;
@@ -280,6 +308,8 @@ K64_INLINE void k64_rdp_fill_rect(int x0, int y0, int x1, int y1) {
   k64_rdp_put(k64_rdpc_fill_rect(x0 * 4, y0 * 4, x1 * 4 - adj, y1 * 4 - adj));
   k64_rdps.prim_pending = true; k64_rdps.stat_prims++;
 }
+// Sets the color image (and the Z image unless z is NULL) and a full-surface scissor;
+// width x height pixels, KSEG0 or physical pointers.
 void k64_rdp_attach(u32 fmt, u32 siz, u32 width, u32 height, void *color, void *z);
 // Fill the attached color image with `fill` (16bpp: two packed pixels, e.g. k64_rgba16(c)*0x10001)
 // and, if clear_z, the attached Z buffer with max depth. Leaves FILL mode set.

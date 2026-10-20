@@ -4,7 +4,14 @@
 #include <k64/thread.h>
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[18_threads] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                               \
+  do {                                              \
+    if (!(c)) {                                     \
+      fails++;                                      \
+      k64_printf("[18_threads] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                             \
+    }                                               \
+  } while (0)
 
 #define STACK(name) static u64 name[512] K64_ALIGN(16)
 #define TOP(s) ((void *)((s) + K64_ARRAY_LEN(s)))

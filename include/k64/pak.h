@@ -82,6 +82,7 @@ k64_cpak_err_t k64_cpak_mount(k64_cpak_fs_t *fs, int port);
 // Erases every note: new ID block (bank count detected), empty page and note tables.
 k64_cpak_err_t k64_cpak_format(int port);
 
+// Unused data pages (256 bytes each) on the mounted pak.
 u32 k64_cpak_free_pages(const k64_cpak_fs_t *fs);
 // false: entry `i` (0..15) unused.
 bool k64_cpak_note(const k64_cpak_fs_t *fs, int i, k64_cpak_note_t *out);

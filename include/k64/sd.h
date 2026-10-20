@@ -50,6 +50,8 @@ typedef struct {
   DWORD map[K64_SD_MAP];
 } k64_sdfile_t;
 
+// false if the card is not mounted or the file is missing. A file in more fragments than
+// the map holds still opens, with slow (chain-walking) seeks.
 bool k64_sd_open(k64_sdfile_t *f, const char *path);
 K64_INLINE u32 k64_sd_size(const k64_sdfile_t *f) { return (u32)f_size(&f->fil); }
 // len bytes at off (clamped to the file), returns the bytes read. Any alignment; whole

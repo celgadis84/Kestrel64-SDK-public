@@ -1,0 +1,22 @@
+# kestrel64-sdk C style. Apply to the lines you touch (git clang-format), not to whole files:
+# short one-line helpers and aligned tables are kept on purpose.
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 120
+PointerAlignment: Right
+DerivePointerAlignment: false
+AllowShortFunctionsOnASingleLine: All
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AllowShortBlocksOnASingleLine: Always
+AlignConsecutiveMacros: Consecutive
+AlignTrailingComments: true
+AlignAfterOpenBracket: Align
+BinPackArguments: true
+BinPackParameters: true
+BreakBeforeBinaryOperators: NonAssignment
+IncludeBlocks: Preserve
+SortIncludes: Never
+SpacesBeforeTrailingComments: 1
+ReflowComments: false
+Cpp11BracedListStyle: true

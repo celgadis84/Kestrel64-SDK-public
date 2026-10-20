@@ -20,12 +20,22 @@ static const int yuv_k[6] = { K64_YUV_CONVERT };
 #define NFMT (sizeof fmts / sizeof fmts[0])
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[30_texfmt] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                              \
+  do {                                             \
+    if (!(c)) {                                    \
+      fails++;                                     \
+      k64_printf("[30_texfmt] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                            \
+    }                                              \
+  } while (0)
 
 static u32 x5(u32 c) { return c << 3 | c >> 2; }
 static s32 sext9(s32 v) { return (s32)((u32)v << 23) >> 23; }
 // Combiner pass-through of a 9-bit filter output (parallel-rdp combiner.h/clamping.h).
-static u32 cc_clamp(s32 v) { v = sext9(sext9(v - 0x80) + 0x80 - 0x80) + 0x80; return v < 0 ? 0 : v > 255 ? 255 : (u32)v; }
+static u32 cc_clamp(s32 v) {
+  v = sext9(sext9(v - 0x80) + 0x80 - 0x80) + 0x80;
+  return v < 0 ? 0 : v > 255 ? 255 : (u32)v;
+}
 
 // Texel (x, y) of a baked texture as 8-bit R, G, B.
 static void texel_rgb(const k64_tex_t *t, u32 x, u32 y, u32 rgb[3]) {
@@ -43,7 +53,9 @@ static void texel_rgb(const k64_tex_t *t, u32 x, u32 y, u32 rgb[3]) {
     case K64_SIZ_4:  v = (row[x / 2] >> (x & 1 ? 0 : 4)) & 15; break;
     case K64_SIZ_8:  v = row[x]; break;
     case K64_SIZ_16: v = (u32)row[2 * x] << 8 | row[2 * x + 1]; break;
-    default:         v = (u32)row[4 * x] << 24 | (u32)row[4 * x + 1] << 16 | (u32)row[4 * x + 2] << 8 | row[4 * x + 3]; break;
+    default:
+      v = (u32)row[4 * x] << 24 | (u32)row[4 * x + 1] << 16 | (u32)row[4 * x + 2] << 8 | row[4 * x + 3];
+      break;
   }
   u32 i;
   if (t->fmt == K64_FMT_CI) v = t->tlut[v];
@@ -86,7 +98,8 @@ int main(void) {
     }
     for (u32 k = 0; k < NFMT; k++)
       k64_text_printf(16 + (k % 5) * 56, 76 + (k / 5) * 56, 0xFFFFFFFF, "%s", fmts[k].name);
-    k64_text_printf(16, 16, 0xFFFFFFFF, "kestrel64-sdk  30 texture formats  %s", frame ? (fails ? "FAIL" : "PASS") : "");
+    k64_text_printf(16, 16, 0xFFFFFFFF, "kestrel64-sdk  30 texture formats  %s",
+                    frame ? (fails ? "FAIL" : "PASS") : "");
     k64_rdp_wait_idle();
 
     if (frame == 0) {
@@ -99,7 +112,9 @@ int main(void) {
             u32 rgb[3];
             texel_rgb(t, x, y, rgb);
             u32 w = (rgb[0] >> 3) << 11 | (rgb[1] >> 3) << 6 | (rgb[2] >> 3) << 1;
-            u32 p = ((const u16 *)((const u8 *)fb->pixels + (40 + (k / 5) * 56 + y) * fb->stride))[16 + (k % 5) * 56 + x] & 0xFFFE;
+            u32 p =
+                ((const u16 *)((const u8 *)fb->pixels + (40 + (k / 5) * 56 + y) * fb->stride))[16 + (k % 5) * 56 + x]
+                & 0xFFFE;
             if (p != w && !bad++) { fx = x; fy = y; got = p; want = w; }
           }
         CHECK(!bad, "%s: %u pixels wrong, first (%u,%u) %04x want %04x", fmts[k].name, bad, fx, fy, got, want);

@@ -32,7 +32,10 @@ static u64 list_buf[64] K64_ALIGN(16);
 static k64_kgfx_vcache_t vc[NV] K64_ALIGN(16);
 
 static u32 rng = 0x12345678;
-static s16 rnd(s16 lo, s16 hi) { rng = rng * 1664525u + 1013904223u; return (s16)(lo + (s32)((rng >> 8) % (u32)(hi - lo + 1))); }
+static s16 rnd(s16 lo, s16 hi) {
+  rng = rng * 1664525u + 1013904223u;
+  return (s16)(lo + (s32)((rng >> 8) % (u32)(hi - lo + 1)));
+}
 
 typedef struct { s32 max_clip, max_sx, max_sy, max_sz; u32 max_invw; u32 attr_bad, flag_bad, checked, cut; } stats_t;
 
@@ -71,7 +74,8 @@ static void check_vertex(stats_t *st, int slot, const k64_vtx_t *in) {
   u32 want = clip_flags(clip);
   if (o->flags != want) {
     if (st->flag_bad++ < 4)
-      k64_printf("[04] flags slot %d got %x want %x clip %x %x %x %x\n", slot, o->flags, want, clip[0], clip[1], clip[2], clip[3]);
+      k64_printf("[04] flags slot %d got %x want %x clip %x %x %x %x\n", slot, o->flags, want, clip[0], clip[1],
+                 clip[2], clip[3]);
   }
   if (want & K64_KGFX_CLIP_CUT) st->cut++;
   if (o->s != in->s || o->t != in->t || o->r != in->r || o->g != in->g || o->b != in->b || o->a != in->a)
@@ -143,7 +147,11 @@ static bool run_test(u32 seed, stats_t *st, u32 *rsp_us) {
 #define TRI_WORDS 22                         // shade + tex + z
 static u64 ref_buf[NT * TRI_WORDS];
 
-typedef struct { u32 tris, slivers, hdr_bad, count_bad, rejected, cut, span_w, span_h; s32 xend, z_span, edge, slope, shade, shade_d, tex, tex_d, texw, z, z_d; u32 rsp_us, cpu_us; } tstats_t;
+typedef struct {
+  u32 tris, slivers, hdr_bad, count_bad, rejected, cut, span_w, span_h;
+  s32 xend, z_span, edge, slope, shade, shade_d, tex, tex_d, texw, z, z_d;
+  u32 rsp_us, cpu_us;
+} tstats_t;
 
 static s32 fx(u64 w, int lane) { return (s16)(u16)(w >> (48 - 16 * lane)); }
 static s32 attr(const u64 *w, int word_i, int word_f, int lane) {
@@ -194,7 +202,10 @@ static void run_tri_test(u32 seed, tstats_t *st) {
   u64 *start = k64_rdp.cur;
   u32 t0 = k64_count();
   for (int i = 0; i < NT; i++) {
-    if (vc[idx[i][0]].flags & vc[idx[i][1]].flags & vc[idx[i][2]].flags & K64_KGFX_CLIP_REJECT) { st->rejected++; continue; }
+    if (vc[idx[i][0]].flags & vc[idx[i][1]].flags & vc[idx[i][2]].flags & K64_KGFX_CLIP_REJECT) {
+      st->rejected++;
+      continue;
+    }
     k64_svtx_t a = svtx_of(&vc[idx[i][0]]), b = svtx_of(&vc[idx[i][1]]), c = svtx_of(&vc[idx[i][2]]);
     k64_rdp_tri(flags, 0, &a, &b, &c);
   }
@@ -220,7 +231,11 @@ static void run_tri_test(u32 seed, tstats_t *st) {
   st->rsp_us += K64_US(k64_count() - t0);
   const u64 *got = K64_KSEG1(start);
   u32 ngot = (u32)(k64_rdp.cur - start);
-  if (status || ngot != nref || ngot % TRI_WORDS) { st->count_bad++; k64_printf("[04] tri status %x words rsp %u cpu %u\n", status, ngot, nref); return; }
+  if (status || ngot != nref || ngot % TRI_WORDS) {
+    st->count_bad++;
+    k64_printf("[04] tri status %x words rsp %u cpu %u\n", status, ngot, nref);
+    return;
+  }
 
   cmp_tris(st, got, ref_buf, ngot / TRI_WORDS);
 }
@@ -512,7 +527,8 @@ static void run_light_test(u32 seed, u32 *bad, u32 *checked, s32 *maxf) {
     const k64_vtx_t *v = &verts[i];
     u16 p = v->norm;
     // decoded normal (as the microcode sees it, unscaled) rotated to world space
-    float nd[3] = { (s8)((p >> 8) & 0xF8) / 8 / 15.5f, (s8)((p >> 3) & 0xFC) / 4 / 31.5f, (s8)((p << 3) & 0xF8) / 8 / 15.5f };
+    float nd[3] = {(s8)((p >> 8) & 0xF8) / 8 / 15.5f, (s8)((p >> 3) & 0xFC) / 4 / 31.5f,
+                   (s8)((p << 3) & 0xF8) / 8 / 15.5f};
     float nw[3];
     for (int r = 0; r < 3; r++) nw[r] = model.m[0][r] * nd[0] + model.m[1][r] * nd[1] + model.m[2][r] * nd[2];
     for (int c = 0; c < 4; c++) {
@@ -591,7 +607,8 @@ static void run_texgen_test(u32 seed, u32 *bad, u32 *checked, s32 *maxf) {
   for (int i = 0; i < NV; i++) {
     const k64_vtx_t *v = &verts[i];
     u16 p = v->norm;
-    float nd[3] = { (s8)((p >> 8) & 0xF8) / 8 / 15.5f, (s8)((p >> 3) & 0xFC) / 4 / 31.5f, (s8)((p << 3) & 0xF8) / 8 / 15.5f };
+    float nd[3] = {(s8)((p >> 8) & 0xF8) / 8 / 15.5f, (s8)((p >> 3) & 0xFC) / 4 / 31.5f,
+                   (s8)((p << 3) & 0xF8) / 8 / 15.5f};
     for (int a = 0; a < 2; a++) {
       s16 got = a ? vc[i].t : vc[i].s, want = texgen_fixed(v, a);
       (*checked)++;
@@ -685,14 +702,16 @@ int main(void) {
 
   tstats_t ts = { 0 };
   for (u32 s = 1; s <= 8; s++) run_tri_test(s * 0x9E3779B9u, &ts);
-  k64_printf("[04] tris %u (slivers %u, rejected %u) hdr %u count %u edge %d slope %d shade %d/%d tex %d/%d w %d z %d/%d (base/deriv) rsp %u us cpu %u us\n",
-             ts.tris, ts.slivers, ts.rejected, ts.hdr_bad, ts.count_bad, ts.edge, ts.slope, ts.shade, ts.shade_d, ts.tex, ts.tex_d, ts.texw,
-             ts.z, ts.z_d, ts.rsp_us, ts.cpu_us);
+  k64_printf(
+      "[04] tris %u (slivers %u, rejected %u) hdr %u count %u edge %d slope %d shade %d/%d tex %d/%d w %d z %d/%d "
+      "(base/deriv) rsp %u us cpu %u us\n",
+      ts.tris, ts.slivers, ts.rejected, ts.hdr_bad, ts.count_bad, ts.edge, ts.slope, ts.shade, ts.shade_d, ts.tex,
+      ts.tex_d, ts.texw, ts.z, ts.z_d, ts.rsp_us, ts.cpu_us);
   // Tolerances (s15.16 lsb): edges/slopes 1/256 px; shade 1/64 and 1/16 of a level; tex 4 units
   // of s10.5, W base 8 of 32767 (a scale difference, see cmp_tris); z 1/16 and 1/8 of a step.
-  bool tpass = ts.tris > 0 && ts.hdr_bad == 0 && ts.count_bad == 0 && ts.edge <= 256 && ts.slope <= 256 &&
-               ts.shade <= 1024 && ts.shade_d <= 4096 && ts.tex <= 0x40000 && ts.tex_d <= 0x40000 && ts.texw <= 0x80000 &&
-               ts.z <= 0x1000 && ts.z_d <= 0x2000;
+  bool tpass = ts.tris > 0 && ts.hdr_bad == 0 && ts.count_bad == 0 && ts.edge <= 256 && ts.slope <= 256
+               && ts.shade <= 1024 && ts.shade_d <= 4096 && ts.tex <= 0x40000 && ts.tex_d <= 0x40000
+               && ts.texw <= 0x80000 && ts.z <= 0x1000 && ts.z_d <= 0x2000;
   k64_printf("[04] triangle setup -> %s\n", tpass ? "PASS" : "FAIL");
 
   tstats_t cs = { 0 };
@@ -702,9 +721,11 @@ int main(void) {
   scene = 0;
   k64_printf("[04] clip: %u verts made: clip %d lsb, screen %d, z %d, color %d, st %d\n",
              vs.n, vs.clip, vs.scr, vs.z, vs.color, vs.st);
-  k64_printf("[04] clip: %u tris cut, %u rejected -> %u out (slivers %u) hdr %u count %u edge %d slope %d (x at edge end %d) shade %d/%d tex %d/%d w %d z %d/%d (span %d/256 steps)\n",
-             cs.cut, cs.rejected, cs.tris, cs.slivers, cs.hdr_bad, cs.count_bad, cs.edge, cs.slope, cs.xend, cs.shade, cs.shade_d,
-             cs.tex, cs.tex_d, cs.texw, cs.z, cs.z_d, cs.z_span);
+  k64_printf(
+      "[04] clip: %u tris cut, %u rejected -> %u out (slivers %u) hdr %u count %u edge %d slope %d (x at edge end %d) "
+      "shade %d/%d tex %d/%d w %d z %d/%d (span %d/256 steps)\n",
+      cs.cut, cs.rejected, cs.tris, cs.slivers, cs.hdr_bad, cs.count_bad, cs.edge, cs.slope, cs.xend, cs.shade,
+      cs.shade_d, cs.tex, cs.tex_d, cs.texw, cs.z, cs.z_d, cs.z_span);
   // Clipped vertices: clip within 16 lsb, screen 1 s13.2 unit, z 4, color and st 2 (both
   // truncate). Setup with the RSP's own vertices: stage B tolerances, except edges are judged
   // by the X error at the edge end (<= 1/16 px), z base 1/8 step and the z error at the far

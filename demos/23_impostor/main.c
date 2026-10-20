@@ -28,7 +28,14 @@ static k64_impostor_t im;
 static u32 build_us;                        // CPU time of the last k64_impostor_draw
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[23_impostor] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                                \
+  do {                                               \
+    if (!(c)) {                                      \
+      fails++;                                       \
+      k64_printf("[23_impostor] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                              \
+    }                                                \
+  } while (0)
 
 static void set_camera(k64_vec3_t eye, k64_vec3_t at) {
   k64_mat4_t proj, view;

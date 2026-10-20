@@ -32,7 +32,8 @@ void k64_audio_init(u32 rate, u32 frames) {
   static u32 cap;                              // frames the buffers hold: a new init reuses them
   for (u32 i = 0; i < AUDIO_BUFS; i++) {
     if (frames > cap)                          // AI DMA reads them: any bank will do, so a full heap spills to fb
-      bufs[i] = k64_mem_alloc(k64_mem_largest_free(K64_ZONE_HEAP) >= frames * 4 + 16 ? K64_ZONE_HEAP : K64_ZONE_FB, frames * 4, 16);
+      bufs[i] = k64_mem_alloc(k64_mem_largest_free(K64_ZONE_HEAP) >= frames * 4 + 16 ? K64_ZONE_HEAP : K64_ZONE_FB,
+                              frames * 4, 16);
     for (u32 k = 0; k < frames * 2; k++) bufs[i][k] = 0;
     k64_dcache_writeback(bufs[i], frames * 4);
   }

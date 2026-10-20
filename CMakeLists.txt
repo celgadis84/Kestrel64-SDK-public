@@ -9,7 +9,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
-set(K64_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+# Cache (not plain) variables: k64_add_rom / k64_add_assets also run from a game project that
+# pulls the SDK in with add_subdirectory, where the SDK scope is not visible.
+set(K64_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}" CACHE INTERNAL "kestrel64-sdk root")
+set(K64_PYTHON "${Python3_EXECUTABLE}" CACHE INTERNAL "Python used by the asset tools")
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -std=gnu11)
 

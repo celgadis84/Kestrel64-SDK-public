@@ -52,7 +52,8 @@ void k64_font_set_palette(u32 index, u32 rgba);
 int k64_font_draw(const k64_font_t *f, int x, int y, u32 rgba, const char *s);
 // Same with up to `len` bytes of s.
 int k64_font_draw_n(const k64_font_t *f, int x, int y, u32 rgba, const char *s, u32 len);
-int k64_font_printf(const k64_font_t *f, int x, int y, u32 rgba, const char *fmt, ...) __attribute__((format(printf, 5, 6)));
+int k64_font_printf(const k64_font_t *f, int x, int y, u32 rgba, const char *fmt, ...)
+    __attribute__((format(printf, 5, 6)));
 
 // Word-wrapped paragraph in a box `w` pixels wide, each line aligned. Breaks at spaces
 // (a word wider than the box is split), honours '\n'. Returns the height used.

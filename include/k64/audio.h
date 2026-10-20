@@ -108,6 +108,8 @@ typedef union K64_ALIGN(8) {
 K64_INLINE u32 k64_mixer_step(u32 src_rate, u32 out_rate) {
   return (u32)(((u64)src_rate << 16) / out_rate);
 }
+// Starts (or restarts) a PCM voice: len samples (plus the guard sample), loop_start <
+// len or K64_NO_LOOP, step from k64_mixer_step (16.16, < 4.0), volumes at once (no ramp).
 void k64_voice_play(k64_voice_t *v, const s16 *data, u32 len, u32 loop_start, u32 step,
                     s16 vol_l, s16 vol_r);
 // Ramps the volume linearly to (vol_l, vol_r) over `frames` output frames (0: at once).

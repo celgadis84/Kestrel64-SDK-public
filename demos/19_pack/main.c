@@ -27,7 +27,14 @@ static u32 gen_patterns(u8 *out) {
 }
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[19_pack] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                            \
+  do {                                           \
+    if (!(c)) {                                  \
+      fails++;                                   \
+      k64_printf("[19_pack] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                          \
+    }                                            \
+  } while (0)
 
 typedef struct { const char *name; u32 raw, packed, us_pi, us_pz, us_unpack, us_ram; } row_t;
 static row_t rows[4];
@@ -64,8 +71,8 @@ static void measure(row_t *r, const char *name, u8 *rom, const u8 *ref) {
   CHECK(k64_unpack(out + 1, z) == n, "%s ram size", name);           // odd destination
   r->us_ram = us_since(t0);
   CHECK(__builtin_memcmp(out + 1, buf, n) == 0 && out[n + 1] == 0xA5, "%s ram decode differs", name);
-  k64_printf("[19_pack] %-7s %6u -> %6u (%2u%%)  pi raw %5u us  pi k64z %5u us  unpack %5u us (ram %5u us)\n", name, r->raw, r->packed,
-             r->packed * 100 / r->raw, r->us_pi, r->us_pz, r->us_unpack, r->us_ram);
+  k64_printf("[19_pack] %-7s %6u -> %6u (%2u%%)  pi raw %5u us  pi k64z %5u us  unpack %5u us (ram %5u us)\n", name,
+             r->raw, r->packed, r->packed * 100 / r->raw, r->us_pi, r->us_pz, r->us_unpack, r->us_ram);
 }
 
 int main(void) {
@@ -74,7 +81,8 @@ int main(void) {
   k64_text_init();
 
   measure(&rows[0], "trex", trex_z, trex_ref);
-  CHECK(rows[0].raw == (u32)(trex_ref_end - trex_ref), "trex raw %u vs %u", rows[0].raw, (u32)(trex_ref_end - trex_ref));
+  CHECK(rows[0].raw == (u32)(trex_ref_end - trex_ref), "trex raw %u vs %u", rows[0].raw,
+        (u32)(trex_ref_end - trex_ref));
   measure(&rows[1], "shrine", shrine_z, NULL);
   measure(&rows[2], "bricks", bricks_z, NULL);
   static u8 pat_ref[32768];
@@ -92,7 +100,8 @@ int main(void) {
     k64_text_printf(8, 48, 0xFFFF80FF, "asset     raw    k64z   pi raw  unpack");
     for (int i = 0; i < 4; i++) {
       row_t *r = &rows[i];
-      k64_text_printf(8, 64 + i * 12, 0xC0C0C0FF, "%-7s %6u %6u %5u us %5u us", r->name, r->raw, r->packed, r->us_pi, r->us_unpack);
+      k64_text_printf(8, 64 + i * 12, 0xC0C0C0FF, "%-7s %6u %6u %5u us %5u us", r->name, r->raw, r->packed, r->us_pi,
+                      r->us_unpack);
     }
     k64_text_printf(8, 124, 0x8080A0FF, "LZ4 decoded in place behind the PI DMA:");
     k64_text_printf(8, 136, 0x8080A0FF, "no scratch buffer, load ~ packed size");

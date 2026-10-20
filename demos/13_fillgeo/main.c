@@ -150,7 +150,11 @@ int main(void) {
   k64_dcache_writeback(&vp, sizeof vp);
 
   static const u8 pal[6][3] = { {230,70,60}, {70,140,230}, {240,200,60}, {200,90,220}, {80,210,200}, {235,235,235} };
-  for (u32 i = 0; i < NCUBES; i++) { cubes[i].r = pal[i % 6][0]; cubes[i].g = pal[i % 6][1]; cubes[i].b = pal[i % 6][2]; }
+  for (u32 i = 0; i < NCUBES; i++) {
+    cubes[i].r = pal[i % 6][0];
+    cubes[i].g = pal[i % 6][1];
+    cubes[i].b = pal[i % 6][2];
+  }
   float ll = 1.f / k64_sqrtf(light.x * light.x + light.y * light.y + light.z * light.z);
   light = (k64_vec3_t){ light.x * ll, light.y * ll, light.z * ll };
 

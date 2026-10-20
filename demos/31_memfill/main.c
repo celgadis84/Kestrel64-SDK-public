@@ -6,7 +6,14 @@
 
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[31_memfill] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                               \
+  do {                                              \
+    if (!(c)) {                                     \
+      fails++;                                      \
+      k64_printf("[31_memfill] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                             \
+    }                                               \
+  } while (0)
 
 static u8 buf[1024] K64_ALIGN(16);
 
@@ -42,7 +49,8 @@ int main(void) {
   u32 bad = 0;
   for (u32 i = 0; i < size; i += 4) bad += *(u32 *)(fb + i) != 0x00010001;
   CHECK(!bad, "clear: %u words wrong", bad);
-  k64_printf("[31_memfill] 150 KB clear: memset + writeback %u us, k64_mem_fill %u us\n", K64_US(t1 - t0), K64_US(t2 - t1));
+  k64_printf("[31_memfill] 150 KB clear: memset + writeback %u us, k64_mem_fill %u us\n", K64_US(t1 - t0),
+             K64_US(t2 - t1));
   k64_printf("[31_memfill] self-test %s (%u failures)\n", fails ? "FAIL" : "PASS", fails);
   for (;;) {}
 }

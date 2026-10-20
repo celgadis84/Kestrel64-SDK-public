@@ -34,7 +34,7 @@ function(k64_add_rom)
   set(rom ${CMAKE_CURRENT_BINARY_DIR}/${R_NAME}.z64)
   add_custom_command(TARGET ${elf} POST_BUILD
     COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${elf}> ${bin}
-    COMMAND ${Python3_EXECUTABLE} ${K64_SDK_DIR}/tools/k64rom.py ${bin} -o ${rom}
+    COMMAND ${K64_PYTHON} ${K64_SDK_DIR}/tools/k64rom.py ${bin} -o ${rom}
             --elf $<TARGET_FILE:${elf}>
             --title "${R_TITLE}" --code ${R_CODE} ${save_opt}
     BYPRODUCTS ${bin} ${rom}
@@ -65,13 +65,13 @@ function(k64_add_ucode target name src)
   add_custom_command(OUTPUT ${outdir}/${name}.text.bin ${outdir}/${name}.data.bin ${outdir}/${name}.h
                             ${outdir}/${name}.ovl.bin
                             ${outdir}/${name}.lst
-    COMMAND ${Python3_EXECUTABLE} ${rsp} ${src} -o ${outdir}/${name}
+    COMMAND ${K64_PYTHON} ${rsp} ${src} -o ${outdir}/${name}
             --header ${outdir}/${name}.h --prefix ${uname} -I ${srcdir} -I ${K64_SDK_DIR}/src/rsp
             --listing ${outdir}/${name}.lst
     DEPENDS ${src} ${rsp} ${incs} VERBATIM)
   set(asm ${outdir}/${name}_ucode.S)
   add_custom_command(OUTPUT ${asm}
-    COMMAND ${Python3_EXECUTABLE} ${bake} embed ${asm} --section rodata
+    COMMAND ${K64_PYTHON} ${bake} embed ${asm} --section rodata
             ${name}_text=${outdir}/${name}.text.bin ${name}_data=${outdir}/${name}.data.bin
             ${name}_ovl=${outdir}/${name}.ovl.bin
     DEPENDS ${outdir}/${name}.text.bin ${outdir}/${name}.data.bin ${outdir}/${name}.ovl.bin ${bake} VERBATIM)
@@ -119,7 +119,7 @@ function(k64_add_assets elf)
       set(fmt ${CMAKE_MATCH_3})
       set(out ${outdir}/${name}.k64t)
       add_custom_command(OUTPUT ${out}
-        COMMAND ${Python3_EXECUTABLE} ${bake} tex ${src} ${out} --format ${fmt}
+        COMMAND ${K64_PYTHON} ${bake} tex ${src} ${out} --format ${fmt}
         DEPENDS ${src} ${bake} VERBATIM)
       list(APPEND pairs "${name}=${out}")
       list(APPEND deps ${out})
@@ -134,7 +134,7 @@ function(k64_add_assets elf)
         separate_arguments(opts UNIX_COMMAND "${CMAKE_MATCH_4}")
         set(out ${outdir}/${name}.k64m)
         add_custom_command(OUTPUT ${out}
-          COMMAND ${Python3_EXECUTABLE} ${bake} model ${src} ${out} ${opts}
+          COMMAND ${K64_PYTHON} ${bake} model ${src} ${out} ${opts}
           DEPENDS ${src} ${bake} ${K64_SDK_DIR}/tools/k64model.py VERBATIM)
         list(APPEND pairs "${name}=${out}")
         list(APPEND deps ${out})
@@ -147,7 +147,7 @@ function(k64_add_assets elf)
         separate_arguments(opts UNIX_COMMAND "${CMAKE_MATCH_4}")
         set(out ${outdir}/${name}.k64i)
         add_custom_command(OUTPUT ${out}
-          COMMAND ${Python3_EXECUTABLE} ${bake} impostor ${src} ${out} ${opts}
+          COMMAND ${K64_PYTHON} ${bake} impostor ${src} ${out} ${opts}
           DEPENDS ${src} ${bake} ${K64_SDK_DIR}/tools/k64impostor.py ${K64_SDK_DIR}/tools/k64model.py VERBATIM)
         list(APPEND pairs "${name}=${out}")
         list(APPEND deps ${out})
@@ -160,7 +160,7 @@ function(k64_add_assets elf)
         separate_arguments(opts UNIX_COMMAND "${CMAKE_MATCH_4}")
         set(out ${outdir}/${name}.k64a)
         add_custom_command(OUTPUT ${out}
-          COMMAND ${Python3_EXECUTABLE} ${bake} adpcm ${src} ${out} ${opts}
+          COMMAND ${K64_PYTHON} ${bake} adpcm ${src} ${out} ${opts}
           DEPENDS ${src} ${bake} ${K64_SDK_DIR}/tools/k64adpcm.py VERBATIM)
         list(APPEND pairs "${name}=${out}")
         list(APPEND deps ${out})
@@ -173,7 +173,7 @@ function(k64_add_assets elf)
         separate_arguments(opts UNIX_COMMAND "${CMAKE_MATCH_4}")
         set(out ${outdir}/${name}.k64q)
         add_custom_command(OUTPUT ${out}
-          COMMAND ${Python3_EXECUTABLE} ${bake} music ${src} ${out} ${opts}
+          COMMAND ${K64_PYTHON} ${bake} music ${src} ${out} ${opts}
           DEPENDS ${src} ${bake} ${K64_SDK_DIR}/tools/k64music.py VERBATIM)
         list(APPEND pairs "${name}=${out}")
         list(APPEND deps ${out})
@@ -186,7 +186,7 @@ function(k64_add_assets elf)
         separate_arguments(opts UNIX_COMMAND "${CMAKE_MATCH_4}")
         set(out ${outdir}/${name}.k64f)
         add_custom_command(OUTPUT ${out}
-          COMMAND ${Python3_EXECUTABLE} ${bake} font ${src} ${out} ${opts}
+          COMMAND ${K64_PYTHON} ${bake} font ${src} ${out} ${opts}
           DEPENDS ${src} ${bake} ${K64_SDK_DIR}/tools/k64font.py VERBATIM)
         list(APPEND pairs "${name}=${out}")
         list(APPEND deps ${out})
@@ -201,7 +201,7 @@ function(k64_add_assets elf)
       endforeach()
       set(out ${outdir}/romfs.k64fs)
       add_custom_command(OUTPUT ${out}
-        COMMAND ${Python3_EXECUTABLE} ${K64_SDK_DIR}/tools/k64fs.py ${out} ${fsdir} ${fsopts}
+        COMMAND ${K64_PYTHON} ${K64_SDK_DIR}/tools/k64fs.py ${out} ${fsdir} ${fsopts}
         DEPENDS ${fsfiles} ${K64_SDK_DIR}/tools/k64fs.py ${K64_SDK_DIR}/tools/k64pack.py VERBATIM)
       list(APPEND pairs "k64_romfs=${out}")
       list(APPEND deps ${out})
@@ -223,18 +223,18 @@ function(k64_add_assets elf)
         if(src MATCHES "\.png$")
           set(in ${outdir}/${name}.k64t)
           add_custom_command(OUTPUT ${in}
-            COMMAND ${Python3_EXECUTABLE} ${bake} tex ${src} ${in} --format ${opts}
+            COMMAND ${K64_PYTHON} ${bake} tex ${src} ${in} --format ${opts}
             DEPENDS ${src} ${bake} VERBATIM)
         elseif(src MATCHES "\.glb$")
           separate_arguments(mopts UNIX_COMMAND "${opts}")
           set(in ${outdir}/${name}.k64m)
           add_custom_command(OUTPUT ${in}
-            COMMAND ${Python3_EXECUTABLE} ${bake} model ${src} ${in} ${mopts}
+            COMMAND ${K64_PYTHON} ${bake} model ${src} ${in} ${mopts}
             DEPENDS ${src} ${bake} ${K64_SDK_DIR}/tools/k64model.py VERBATIM)
         endif()
         set(out ${outdir}/${name}.k64z)
         add_custom_command(OUTPUT ${out}
-          COMMAND ${Python3_EXECUTABLE} ${pack} ${in} ${out}
+          COMMAND ${K64_PYTHON} ${pack} ${in} ${out}
           DEPENDS ${in} ${pack} VERBATIM)
         list(APPEND pairs "${name}=${out}")
         list(APPEND deps ${out})
@@ -255,7 +255,7 @@ function(k64_add_assets elf)
         set(sec rom)
       endif()
       add_custom_command(OUTPUT ${asm}
-        COMMAND ${Python3_EXECUTABLE} ${bake} embed ${asm} --section ${sec} ${pairs}
+        COMMAND ${K64_PYTHON} ${bake} embed ${asm} --section ${sec} ${pairs}
         DEPENDS ${deps} ${bake} VERBATIM)
       set_source_files_properties(${asm} PROPERTIES OBJECT_DEPENDS "${deps}")
       target_sources(${elf} PRIVATE ${asm})

@@ -21,6 +21,9 @@ typedef struct {
 
 extern k64_pad_t k64_pads[4];
 
+// start: sends the read command, returns with the reply DMA in flight.
+// end: waits for it and updates k64_pads (a missing pad reads present = false, all zero);
+// does nothing if no poll is pending.
 void k64_pad_poll_start(void);
 void k64_pad_poll_end(void);
-void k64_pad_poll(void);
+void k64_pad_poll(void);       // start + end

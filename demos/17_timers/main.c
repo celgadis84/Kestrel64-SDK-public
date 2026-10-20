@@ -4,7 +4,14 @@
 #include <k64/k64.h>
 
 static u32 fails;
-#define CHECK(c, ...) do { if (!(c)) { fails++; k64_printf("[17_timers] FAIL " __VA_ARGS__); k64_printf("\n"); } } while (0)
+#define CHECK(c, ...)                              \
+  do {                                             \
+    if (!(c)) {                                    \
+      fails++;                                     \
+      k64_printf("[17_timers] FAIL " __VA_ARGS__); \
+      k64_printf("\n");                            \
+    }                                              \
+  } while (0)
 
 static void count_cb(k64_timer_t *t, void *arg) { (void)t; (*(u32 *)arg)++; }
 
@@ -52,7 +59,8 @@ static void self_test(void) {
   u64 first = per.deadline;
   poll_until(K64_TICKS_US(20500));
   CHECK(n == 20, "periodic n=%u", n);
-  CHECK(per.deadline == first + 20 * K64_TICKS_MS(1) && first - t0 - K64_TICKS_MS(1) < K64_TICKS_US(50), "periodic phase");
+  CHECK(per.deadline == first + 20 * K64_TICKS_MS(1) && first - t0 - K64_TICKS_MS(1) < K64_TICKS_US(50),
+        "periodic phase");
   CHECK(per.overruns == 0, "periodic overruns %u", per.overruns);
 
   // Overrun: stall 5.5 periods, one call, 5 skipped, phase kept.

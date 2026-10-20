@@ -36,10 +36,18 @@ static u32 log2_ceil(u32 v) { u32 n = 0; while ((1u << n) < v) n++; return n; }
 
 static void sync_for_load(void) {
   k64_rdp_pipe_guard();
-  if (k64_rdps.load_pending) { k64_rdp_put(k64_rdpc_sync_load()); k64_rdps.load_pending = false; k64_rdps.stat_syncs_load++; }
+  if (k64_rdps.load_pending) {
+    k64_rdp_put(k64_rdpc_sync_load());
+    k64_rdps.load_pending = false;
+    k64_rdps.stat_syncs_load++;
+  }
 }
 static void sync_for_tile(void) {
-  if (k64_rdps.tile_pending) { k64_rdp_put(k64_rdpc_sync_tile()); k64_rdps.tile_pending = false; k64_rdps.stat_syncs_tile++; }
+  if (k64_rdps.tile_pending) {
+    k64_rdp_put(k64_rdpc_sync_tile());
+    k64_rdps.tile_pending = false;
+    k64_rdps.stat_syncs_tile++;
+  }
 }
 
 // TMEM load of the whole texture (TLUT first for CI) through LOAD_TILE.

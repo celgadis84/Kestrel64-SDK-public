@@ -5,12 +5,18 @@
 #include "hw.h"
 #include <stdarg.h>
 
+// Small printf: %d %i %u %x %X %p %c %s %f %F %%, flags - and 0, width, .precision, l / ll.
+// Always NUL-terminates (size > 0); returns the length the full output would have.
 int  k64_vsnprintf(char *buf, u32 size, const char *fmt, va_list ap);
 int  k64_snprintf(char *buf, u32 size, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
+// Raw bytes to the IS-Viewer port (blocking PI writes, 512 bytes at a time).
 void k64_debug_write(const char *s, u32 len);
+// Formats into a 256-byte stack buffer (longer output is cut) and writes it.
 void k64_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+// Shows the crash screen with the formatted message (cut at 159 chars); never returns.
 __attribute__((noreturn)) void k64_panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// What returning from main does: logs the code and spins forever (there is nothing to exit to).
 __attribute__((noreturn)) void k64_exit(int code);
 
 // Crash screen (k64_panic, unhandled CPU exceptions): message, PC and backtrace with function

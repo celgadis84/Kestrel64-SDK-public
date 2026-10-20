@@ -26,7 +26,10 @@ typedef struct {
   u8  index;
 } k64_surface_t;
 
-k64_tv_t k64_tv_type(void);
+k64_tv_t k64_tv_type(void);                         // from the boot code (osTvType)
+// Allocates cfg->buffers (1-3) framebuffers in K64_ZONE_FB (64-byte aligned), clears them to
+// black and programs the VI for the console's TV type (unknown types run as NTSC). Asserts on
+// an unsupported size. A second call allocates new buffers; the old ones are not freed.
 void k64_display_init(const k64_display_cfg_t *cfg);
 const k64_surface_t *k64_display_acquire(void);     // next back buffer
 const k64_surface_t *k64_display_surface(u32 i);    // buffer i of the chain
@@ -44,6 +47,7 @@ void k64_vi_set_origin(u32 phys);
 // to the display's own buffers.
 void k64_display_scan(u32 phys, u16 width, u16 height, u16 stride_px);
 
+// 8-bit channels to the RDP / VI pixel formats: RGBA5551 (alpha 0 or 1) and RGBA8888.
 K64_INLINE u16 k64_rgba16(u8 r, u8 g, u8 b, u8 a) {
   return (u16)(((r >> 3) << 11) | ((g >> 3) << 6) | ((b >> 3) << 1) | (a ? 1 : 0));
 }
