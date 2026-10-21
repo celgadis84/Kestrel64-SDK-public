@@ -5,6 +5,7 @@
 
 void *memcpy(void *restrict dst, const void *restrict src, size_t n) {
   u8 *d = dst; const u8 *s = src;
+  // Same offset mod 8: head bytes up to 8-byte alignment, doublewords (4 per loop), then the rest.
   if ((((u32)d ^ (u32)s) & 7) == 0) {
     while (n && ((u32)d & 7)) { *d++ = *s++; n--; }
     u64 *d8 = (u64*)d; const u64 *s8 = (const u64*)s;
@@ -12,7 +13,7 @@ void *memcpy(void *restrict dst, const void *restrict src, size_t n) {
                       d8[0] = a; d8[1] = b; d8[2] = c; d8[3] = e; d8 += 4; s8 += 4; n -= 32; }
     while (n >= 8)  { *d8++ = *s8++; n -= 8; }
     d = (u8*)d8; s = (const u8*)s8;
-  } else if ((((u32)d ^ (u32)s) & 3) == 0) {
+  } else if ((((u32)d ^ (u32)s) & 3) == 0) {   // only mod 4 matches: word copies
     while (n && ((u32)d & 3)) { *d++ = *s++; n--; }
     u32 *d4 = (u32*)d; const u32 *s4 = (const u32*)s;
     while (n >= 4) { *d4++ = *s4++; n -= 4; }
@@ -22,6 +23,7 @@ void *memcpy(void *restrict dst, const void *restrict src, size_t n) {
   return dst;
 }
 
+// Forward copy is safe unless dst lies inside (src, src + n): then copy backwards.
 void *memmove(void *dst, const void *src, size_t n) {
   u8 *d = dst; const u8 *s = src;
   if (d <= s || d >= s + n) return memcpy(dst, src, n);
@@ -29,6 +31,7 @@ void *memmove(void *dst, const void *src, size_t n) {
   return dst;
 }
 
+// Byte replicated to 64 bits and stored as doublewords; head and tail are bytewise.
 void *memset(void *dst, int c, size_t n) {
   u8 *d = dst;
   u64 v = (u8)c; v |= v << 8; v |= v << 16; v |= v << 32;
@@ -51,7 +54,7 @@ size_t strlen(const char *s) { const char *p = s; while (*p) p++; return (size_t
 
 int strcmp(const char *a, const char *b) {
   while (*a && *a == *b) a++, b++;
-  return (u8)*a - (u8)*b;
+  return (u8)*a - (u8)*b;   // compared as unsigned char
 }
 
 int strncmp(const char *a, const char *b, size_t n) {

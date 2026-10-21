@@ -16,13 +16,18 @@ extern const u8 __text_start[], __text_end[];
 
 // ---- symbols (ROM, read through the PI) -------------------------------------------------
 #define SYM_MAGIC 0x4B363453u   // "K64S"
+// Table at sym_base: magic, count, then count entries of {addr, size, name offset} (12 bytes,
+// sorted by addr), names NUL-terminated at sym_base + name offset.
 static u32 sym_base, sym_n;
 
+// One ROM word at off through the PI's direct (uncached KSEG1) window; the PI must be idle, as a
+// direct read during a DMA returns garbage.
 static u32 rom_rd(u32 off) {
   while (PI_STATUS & (PI_ST_DMA_BUSY | PI_ST_IO_BUSY)) {}
   return K64_REG(0xB0000000u + off);
 }
 
+// Finds the table from header word 0x34; any implausible offset, magic or count leaves it off.
 static void sym_init(void) {
   u32 o = rom_rd(0x34);
   if ((o & 3) || o < 0x1000 || o >= 0x4000000 || rom_rd(o) != SYM_MAGIC) return;
@@ -36,7 +41,7 @@ static u32 sym_find(u32 pc, char *name, u32 size) {
   if (name) name[0] = 0;
   if (!sym_n) return 0;
   u32 lo = 0, hi = sym_n;
-  while (hi - lo > 1) {
+  while (hi - lo > 1) {                 // last entry with addr <= pc
     u32 m = (lo + hi) / 2;
     if (rom_rd(sym_base + 8 + m * 12) <= pc) lo = m; else hi = m;
   }
@@ -46,7 +51,7 @@ static u32 sym_find(u32 pc, char *name, u32 size) {
     u32 s = sym_base + rom_rd(e + 8), i = 0;
     for (; i + 1 < size; i++) {
       u32 b = s + i;
-      char c = (char)(rom_rd(b & ~3u) >> (24 - 8 * (b & 3)));
+      char c = (char)(rom_rd(b & ~3u) >> (24 - 8 * (b & 3)));   // PI reads are words, big-endian
       if (!c) break;
       name[i] = c;
     }
@@ -64,6 +69,7 @@ static void sym_fmt(u32 pc, char *out, u32 size) {
 }
 
 // ---- backtrace --------------------------------------------------------------------------
+// Plausibility checks for walked values: word-aligned code inside the image, stack in RDRAM.
 static bool in_text(u32 a) { return !(a & 3) && a >= (u32)__text_start && a < (u32)__text_end; }
 static bool in_ram(u32 a) { return !(a & 3) && a >= 0x80000000u && a < 0x80800000u; }
 
@@ -109,6 +115,7 @@ static const k64_surface_t *fb;
 static u32 cy, cols;
 static u32 col_bg, col_fg, col_hi, col_dim;
 
+// 8x8 glyphs, written through KSEG1 so they reach RDRAM (and the VI) with no cache flush.
 static void put(u32 x, u32 y, u32 color, const char *s) {
   for (; *s; s++, x += 8) {
     u8 c = (u8)*s;
@@ -139,6 +146,8 @@ static void line(u32 color, const char *s) {
   }
 }
 
+// Clears the buffer the VI shows (bringing up a 320x240 display if none exists) and picks the
+// colours for its depth. False if no display could be had: the report then only goes to the log.
 static bool screen_open(void) {
   fb = k64_display_front();
   if (!fb->pixels) {
@@ -176,7 +185,7 @@ static __attribute__((noreturn)) void report(const char *title, const k64_exc_fr
                                              int skip) {
   static int depth;
   if (depth++) for (;;) {}              // crashed while reporting
-  k64_set_status(K64_C0_READ(12) & ~1u);
+  k64_set_status(K64_C0_READ(12) & ~1u);   // IE off: no thread switch or handler from here on
   sym_init();
   char buf[160], s[64];
   u32 bt[12];
@@ -235,7 +244,7 @@ void k64_crash(k64_exc_frame_t *f) {
   report(title, f, f->epc, (u32)f->gpr[29], (u32)f->gpr[31], 0);
 }
 
-// Kept for code that drew its own title (fault probes): same screen, no backtrace.
+// Kept for code that drew its own title (fault probes): same screen, under the caller's title.
 void k64_crash_screen(const char *title, const k64_exc_frame_t *f) {
   report(title, f, f ? f->epc : 0, f ? (u32)f->gpr[29] : 0, f ? (u32)f->gpr[31] : 0, 0);
 }

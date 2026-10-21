@@ -8,7 +8,7 @@
 //
 //   k64_model_load(&m, blob);                 // once: patches the command list in place
 //   k64_model_pose(&m, frame);                // animation frame (fractional, wraps)
-//   k64_model_prepare(&m, &viewproj, &world, lights, n, ar, ag, ab);
+//   k64_model_prepare(&m, &viewproj, &world, lights, nlights, ar, ag, ab);
 //   k64_rdp_load_tex(0, 0, &m.tex, ...);      // CI: other modes need K64_OM_TLUT
 //   k64_model_draw(&list, &m);                // CALL into the baked list
 //
@@ -24,7 +24,7 @@
 #include "tex.h"
 
 typedef struct {
-  char magic[4];                          // 'K6M2'
+  char fourcc[4];                          // 'K6M2'
   u16 njoints, nvb, nframes, fps;
   u32 ncmds, off_cmds, off_verts, nverts;
   u32 off_parent, off_invbind, off_root, off_vb, off_anim;
@@ -50,7 +50,7 @@ typedef struct {
   k64_tex_t tex;
   k64_mat4_t *skin;                       // per joint, model space (k64_model_pose)
   k64_kgfx_mtxlights_t *bones[2];         // per virtual bone (k64_model_prepare)
-  k64_mat4_t *tmp;                        // 2 per joint: pose / prepare scratch
+  k64_mat4_t *scratch;                        // 2 per joint: pose / prepare scratch
   u32 cur;                                // buffer set of the last prepare
 } k64_model_t;
 
@@ -60,7 +60,7 @@ typedef struct {
 bool k64_model_load(k64_model_t *m, void *blob);
 void k64_model_pose(k64_model_t *m, float frame);
 void k64_model_prepare(k64_model_t *m, const k64_mat4_t *viewproj, const k64_mat4_t *world,
-                       const k64_kgfx_light_t *lights, u32 n, u8 amb_r, u8 amb_g, u8 amb_b);
+                       const k64_kgfx_light_t *lights, u32 nlights, u8 amb_r, u8 amb_g, u8 amb_b);
 // Records a CALL to the command list of the last prepare. Uses all vertex cache slots and
 // leaves the matrix and light block of its last group loaded.
 K64_INLINE void k64_model_draw(k64_kgfx_list_t *l, const k64_model_t *m) { k64_kgfx_call(l, m->cmds[0][m->cur]); }

@@ -14,6 +14,7 @@ static float exp2_(float x) {
   return i >= 0 ? p * (float)(1u << (i > 30 ? 30 : i)) : p / (float)(1u << (-i > 30 ? 30 : -i));
 }
 
+// MIDI variable-length value: 7 bits per byte, the high bit set on all but the last byte
 static u32 rd_var(const u8 **p) {
   u32 v = 0;
   u8 b;
@@ -21,8 +22,11 @@ static u32 rd_var(const u8 **p) {
   return v;
 }
 
+// milliseconds to output frames
 static u32 frames_ms(const k64_music_t *mu, u32 ms) { return ms * mu->rate / 1000; }
 
+// song ticks per output frame, 32.32: ppq ticks per tempo period at the output rate, times the
+// speed (Q8)
 static void tick_rate(k64_music_t *mu) {
   u64 r = ((u64)mu->ppq * 1000000u << 32) / ((u64)mu->tempo * mu->rate);
   mu->tick_rate = r * mu->speed >> 8;
@@ -36,6 +40,7 @@ void k64_music_init(k64_music_t *mu, k64_mixer_t *m, u32 first, u32 nvoices, k64
   tick_rate(mu);
 }
 
+// MIDI defaults: volume 100, centre pan, expression 127, bend range 2 semitones
 static void reset_channels(k64_music_t *mu) {
   for (u32 c = 0; c < K64_MUSIC_CHANNELS; c++)
     mu->ch[c] = (k64_music_channel_t){ .volume = 100, .pan = 64, .expression = 127, .bend_range = 2 };
@@ -66,8 +71,11 @@ void k64_music_speed(k64_music_t *mu, u16 speed) {
 
 // ---- voices -----------------------------------------------------------------------------------
 
+// the mixer voice behind player voice i
 static k64_voice_t *mvoice(k64_music_t *mu, u32 i) { return &mu->mixer->v[mu->first + i]; }
 
+// gains: velocity, channel volume and expression, each squared (MIDI curve); pan as an
+// equal-power sine/cosine pair
 static void gains(k64_music_t *mu, k64_music_voice_t *v) {
   const k64_music_channel_t *c = &mu->ch[v->ch];
   float vel = v->vel * (1.f / 127), vol = c->volume * (1.f / 127), ex = c->expression * (1.f / 127);
@@ -85,6 +93,7 @@ static void apply(k64_music_t *mu, u32 i, u32 frames) {
   k64_voice_volume(mvoice(mu, i), (s16)(v->level * v->gain_l), (s16)(v->level * v->gain_r), frames);
 }
 
+// step (16.16) = note pitch times the channel bend, clamped to [1, 4.0) (the mixer's limit)
 static void set_step(k64_music_t *mu, u32 i) {
   k64_music_voice_t *v = &mu->v[i];
   const k64_music_channel_t *c = &mu->ch[v->ch];
@@ -94,6 +103,7 @@ static void set_step(k64_music_t *mu, u32 i) {
   mvoice(mu, i)->step = st >= 262143.f ? 262143u : st < 1.f ? 1u : (u32)st;
 }
 
+// key off: the envelope ramps to zero over the release time (at least MIN_RAMP)
 static void release(k64_music_t *mu, u32 i) {
   k64_music_voice_t *v = &mu->v[i];
   u32 f = frames_ms(mu, v->inst->release);
@@ -122,6 +132,7 @@ static int pick(k64_music_t *mu, const k64_instrument_t *in) {
   return best;
 }
 
+// instrument for a channel and key: the drum table on channel 10, else the channel's program
 static const k64_instrument_t *instrument(k64_music_t *mu, u32 ch, u32 key) {
   if (ch == 9) return mu->bank->drum[key];
   const k64_instrument_t *in = mu->bank->program[mu->ch[ch].program];
@@ -165,6 +176,7 @@ void k64_music_stop(k64_music_t *mu) {
     if (mu->v[i].stage != K64_ENV_OFF && mu->v[i].stage != K64_ENV_RELEASE) release(mu, i);
 }
 
+// applies a channel change to its sounding voices: pitch only, or gains and a volume ramp
 static void channel_changed(k64_music_t *mu, u32 ch, bool pitch) {
   for (u32 i = 0; i < mu->nvoices; i++) {
     k64_music_voice_t *v = &mu->v[i];
@@ -180,6 +192,7 @@ void k64_music_volume(k64_music_t *mu, u8 volume) {
   for (u32 c = 0; c < K64_MUSIC_CHANNELS; c++) channel_changed(mu, c, false);
 }
 
+// a note with no voice: kept for the next list; dropped when the pending queue is full
 static void defer(k64_music_t *mu, u32 ch, u32 key, u32 vel, u32 end) {
   if (mu->npending == K64_MUSIC_PENDING) { mu->stats.dropped++; return; }
   mu->pending[mu->npending++] = (k64_music_note_t){ (u8)ch, (u8)key, (u8)vel, end };
@@ -196,6 +209,7 @@ static void event(k64_music_t *mu) {
     case 0: {
       u32 key = p[0], vel = p[1];
       p += 2;
+      // the duration (a delta in ticks) follows the velocity: there are no note-off events
       u32 end = mu->next + rd_var(&p);
       if (!note_on(mu, ch, key, vel, end)) defer(mu, ch, key, vel, end);
       break;
@@ -214,26 +228,32 @@ static void event(k64_music_t *mu) {
     case 7: c->bend_range = *p++; channel_changed(mu, ch, true); break;
     }
   } else if (op == 0xF0) {
+    // 24-bit microseconds per quarter note
     mu->tempo = (u32)p[0] << 16 | p[1] << 8 | p[2];
     p += 3;
     tick_rate(mu);
   } else if (op == 0xF1) {
     mu->loop = p;
   } else if (op == 0xF2 && mu->loop) {
+    // loop end: back to the marked loop start
     p = mu->loop;
     mu->stats.loops++;
   } else {
+    // end of song (or an unknown op): no more events; sounding notes end on their own
     mu->playing = false;
     mu->pos = p;
     return;
   }
+  // the delta to the next event's tick
   mu->next += rd_var(&p);
   mu->pos = p;
 }
 
 void k64_music_tick(void *ctx, u32 frame, u32 n) {
   k64_music_t *mu = ctx;
+  // integer song tick; the fraction carries over in mu->now
   u32 now = (u32)(mu->now >> 32);
+  // first block of the list: the restart record resets, deferred notes get voices first
   if (frame == 0) {
     mu->played = 0;
     u32 np = mu->npending;
@@ -252,10 +272,12 @@ void k64_music_tick(void *ctx, u32 frame, u32 n) {
     k64_voice_t *m = mvoice(mu, i);
     if (v->stage == K64_ENV_OFF) continue;
     if (!m->on) { v->stage = K64_ENV_OFF; continue; }   // one-shot sample ended
+    // the note's end: key off, or hold it while the sustain pedal is down
     if (v->stage < K64_ENV_RELEASE && !v->held && v->release_tick <= now) {
       if (mu->ch[v->ch].sustain) v->held = true;
       else release(mu, i);
     }
+    // envelope stage done: attack -> decay -> sustain; a released voice ends here
     if (!v->left) {
       if (v->stage == K64_ENV_ATTACK) {
         v->stage = K64_ENV_DECAY;
@@ -266,6 +288,7 @@ void k64_music_tick(void *ctx, u32 frame, u32 n) {
       if (v->stage == K64_ENV_DECAY && !v->left) v->stage = K64_ENV_SUSTAIN;
       if (v->stage == K64_ENV_RELEASE) { m->on = false; v->stage = K64_ENV_OFF; continue; }
     }
+    // an ADPCM voice in this list: no note may restart its decoder in this list (see pick)
     if (m->adpcm) mu->played |= 1u << i;
     v->left = v->left > n ? v->left - n : 0;
     active++;

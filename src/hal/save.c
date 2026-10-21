@@ -13,12 +13,14 @@
 static k64_save_type_t type;
 static bool eep_busy;             // a write was issued: poll before the next command
 
+// Bytes per k64_save_type_t value (index = enum value).
 static const u32 sizes[] = { 0, 512, 2048, 32 * 1024, 128 * 1024, 128 * 1024, 96 * 1024 };
 
 k64_save_type_t k64_save_type(void) { return type; }
 u32 k64_save_size(void) { return sizes[type]; }
 
 // ---- EEPROM ----
+// Joybus identify: device ID in rx[0..1], status in rx[2]. Returns 0 when there is no reply.
 static u16 eep_identify(u8 *status) {
   u8 tx = 0x00, rx[3];
   if (!k64_joybus_cmd(EEP_CHANNEL, &tx, 1, rx, 3)) return 0;
@@ -26,6 +28,7 @@ static u16 eep_identify(u8 *status) {
   return (u16)(rx[0] << 8 | rx[1]);
 }
 
+// Polls identify until the EEPROM's internal write cycle clears its busy bit.
 static void eep_wait(void) {
   if (!eep_busy) return;
   u8 st;
@@ -33,12 +36,14 @@ static void eep_wait(void) {
   eep_busy = false;
 }
 
+// One 8-byte block over the joybus (command 0x04). Waits out a pending write first.
 static bool eep_read_block(u32 block, u8 out[8]) {
   eep_wait();
   u8 tx[2] = { 0x04, (u8)block };
   return k64_joybus_cmd(EEP_CHANNEL, tx, 2, out, 8);
 }
 
+// Command 0x05. The chip then runs an internal write cycle, so eep_busy makes the next access wait.
 static bool eep_write_block(u32 block, const u8 in[8]) {
   eep_wait();
   u8 tx[10] = { 0x05, (u8)block }, st;
@@ -48,6 +53,7 @@ static bool eep_write_block(u32 block, const u8 in[8]) {
   return true;
 }
 
+// Byte-granular access over 8-byte blocks.
 static bool eep_read(u32 off, u8 *dst, u32 len) {
   while (len) {
     u8 b[8];
@@ -59,6 +65,7 @@ static bool eep_read(u32 off, u8 *dst, u32 len) {
   return true;
 }
 
+// Partial blocks are read-modify-written; a block is only written when a byte in it changed.
 static bool eep_write(u32 off, const u8 *src, u32 len) {
   while (len) {
     u8 b[8];
@@ -76,6 +83,7 @@ static bool eep_write(u32 off, const u8 *src, u32 len) {
 // DMA through an aligned bounce buffer: any caller alignment / length.
 static u8 bounce[512] __attribute__((aligned(16)));
 
+// RDRAM -> cart by PI DMA (PI_RD_LEN is the RDRAM-to-cart direction), from the bounce buffer.
 static void sram_dma_to_cart(u32 addr, u32 len) {
   k64_dcache_writeback(bounce, len);
   k64_pi_wait();
@@ -94,6 +102,7 @@ static u32 sram_addr(u32 off, u32 *room) {
   return PI_DOM2_ADDR2 + ((off >> 15) << 18) + (off & 0x7FFF);
 }
 
+// Reads through the bounce buffer, one bank-limited chunk per DMA.
 static bool sram_read(u32 off, u8 *dst, u32 len) {
   while (len) {
     u32 room, cart = sram_addr(off, &room);
@@ -107,6 +116,7 @@ static bool sram_read(u32 off, u8 *dst, u32 len) {
   return true;
 }
 
+// Writes through the bounce buffer, one bank-limited chunk per DMA.
 static bool sram_write(u32 off, const u8 *src, u32 len) {
   while (len) {
     u32 room, cart = sram_addr(off, &room);
@@ -144,9 +154,13 @@ static bool fl_old;               // early Macronix chips: array address = page 
 static u8 *fl_sector;             // 16 KiB scratch for a sector rewrite (allocated on first use)
 static u8 fl_page[FL_PAGE] __attribute__((aligned(16)));
 
+// Waits for PI to go idle, then writes one command word to the FlashRAM command register.
 static void fl_cmd(u32 c) { k64_pi_wait(); *(volatile u32 *)FL_CMD = c; }
+// One word from the data port: status or array data, depending on the last command.
 static u32 fl_read_io(void) { k64_pi_wait(); return *(volatile u32 *)FL_DATA; }
+// Resets the status register: status command, then a zero write to the data port.
 static void fl_clear_status(void) { fl_cmd(FL_STATUS); k64_pi_wait(); *(volatile u32 *)FL_DATA = 0; }
+// Cart address of a page; old Macronix chips address 64-byte halves (page * 64).
 static u32 fl_addr(u32 page) { return PI_DOM2_ADDR2 + page * (fl_old ? FL_PAGE / 2 : FL_PAGE); }
 
 // Reads whole pages; a DMA never crosses a 256-page boundary (as libultra).
@@ -161,6 +175,7 @@ static void fl_read_pages(u32 page, u8 *dst, u32 n) {
   }
 }
 
+// Loads one page into the chip buffer by PI DMA, then programs it. Polls until the busy bit clears.
 static bool fl_program(u32 page, const u8 *src) {
   fl_cmd(FL_LOAD_PAGE);
   k64_dcache_writeback(src, FL_PAGE);
@@ -178,6 +193,7 @@ static bool fl_program(u32 page, const u8 *src) {
   return (st & 4) != 0;
 }
 
+// Erases the 16 KiB sector that holds page, then polls until the busy bit clears.
 static bool fl_erase(u32 page) {
   fl_cmd(FL_ERASE_SECT | page);
   fl_cmd(FL_ERASE_EXEC);
@@ -187,6 +203,7 @@ static bool fl_erase(u32 page) {
   return (st & 8) != 0;
 }
 
+// Reads through the bounce buffer, whole pages at a time.
 static bool fl_read(u32 off, u8 *dst, u32 len) {
   while (len) {
     u32 page = off / FL_PAGE, o = off % FL_PAGE;
@@ -231,6 +248,8 @@ static bool fl_write(u32 off, const u8 *src, u32 len) {
     if (erase) {
       if (!fl_sector) fl_sector = k64_mem_alloc(K64_ZONE_HEAP, FL_SECTOR, 16);
       if (!fl_sector) return false;
+      // Slow path: keep a copy of the whole sector, patch it, erase, then reprogram the
+      // pages that are not blank.
       fl_read_pages(base, fl_sector, 128);
       for (u32 i = 0; i < n; i++) fl_sector[so + i] = src[i];
       if (!fl_erase(base)) return false;
@@ -261,9 +280,13 @@ static bool fl_detect(void) {
 // ---- API ----
 k64_save_type_t k64_save_init(void) {
   static u8 hdr[8] __attribute__((aligned(16)));
+  // ROM header bytes 0x38-0x3F: the 'E','D' marker sits at 0x3C-0x3D, the save type in the high
+  // nibble of 0x3F.
   k64_pi_read(hdr, 0x10000038, 8);
   int want = -1;                               // from the header, -1 = not declared
   if (hdr[4] == 'E' && hdr[5] == 'D') {
+    // Save type codes: 1 EEPROM 4K, 2 EEPROM 16K, 3 SRAM 256K, 4 SRAM 768K, 5 FlashRAM 1M,
+    // 6 SRAM 1M.
     switch (hdr[7] >> 4) {
       case 1: want = K64_SAVE_EEPROM4K; break;
       case 2: want = K64_SAVE_EEPROM16K; break;
@@ -282,6 +305,7 @@ k64_save_type_t k64_save_init(void) {
   } else if (want == K64_SAVE_FLASH1M) {
     if (fl_detect()) type = K64_SAVE_FLASH1M;
   } else if (want == -1 || want == K64_SAVE_EEPROM4K || want == K64_SAVE_EEPROM16K) {
+    // Undeclared or EEPROM: probe the joybus EEPROM (ID 0x0080 = 4K, 0x00C0 = 16K).
     u16 id = eep_identify(NULL);
     if (id == 0x0080) type = K64_SAVE_EEPROM4K;
     else if (id == 0x00C0) type = K64_SAVE_EEPROM16K;

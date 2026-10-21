@@ -9,13 +9,13 @@
 #include "hw.h"
 
 typedef struct {
-  u32 magic;              // 'K64Z'
+  u32 fourcc;              // 'K64Z'
   u32 raw_size;           // decoded bytes
   u32 packed_size;        // LZ4 stream bytes
   u32 buf_size;           // in-place buffer: raw_size + margin, multiple of 16
 } k64_pack_hdr_t;
 
-#define K64_PACK_MAGIC 0x4B36345Au
+#define K64_PACK_FOURCC 0x4B36345Au
 
 // Header of a ROM-resident .k64z (one 16-byte PI read).
 k64_pack_hdr_t k64_pack_info(u32 rom_addr);

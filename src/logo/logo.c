@@ -30,11 +30,13 @@ static void mat_from(k64_mat4_t *m, const float r[3][3], const float t[3]) {
   m->m[3][3] = 1;
 }
 
+// o = a * b for 3x3 matrices
 static void mul3(float o[3][3], const float a[3][3], const float b[3][3]) {
   for (int i = 0; i < 3; i++)
     for (int j = 0; j < 3; j++) o[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
 }
 
+// rotation by angle a about the unit axis u (Rodrigues' formula)
 static void rot_axis(float r[3][3], const float u[3], float a) {
   float c = k64_cosf(a), s = k64_sinf(a), t = 1 - c;
   r[0][0] = c + u[0] * u[0] * t;        r[0][1] = u[0] * u[1] * t - u[2] * s; r[0][2] = u[0] * u[2] * t + u[1] * s;
@@ -42,6 +44,7 @@ static void rot_axis(float r[3][3], const float u[3], float a) {
   r[2][0] = u[2] * u[0] * t - u[1] * s; r[2][1] = u[2] * u[1] * t + u[0] * s; r[2][2] = c + u[2] * u[2] * t;
 }
 
+// rotation matrix of a quaternion (w, x, y, z) stored in 1/16384 units
 static void quat_rot(float r[3][3], const s16 *q) {
   float w = q[0] / 16384.f, x = q[1] / 16384.f, y = q[2] / 16384.f, z = q[3] / 16384.f;
   r[0][0] = 1 - 2 * (y * y + z * z); r[0][1] = 2 * (x * y - w * z);     r[0][2] = 2 * (x * z + w * y);
@@ -49,6 +52,7 @@ static void quat_rot(float r[3][3], const s16 *q) {
   r[2][0] = 2 * (x * z - w * y);     r[2][1] = 2 * (y * z + w * x);     r[2][2] = 1 - 2 * (x * x + y * y);
 }
 
+// a to b by t (0..1), rounded and clamped to 8 bits
 static u8 mix8(float a, float b, float t) {
   float v = a + (b - a) * t;
   return (u8)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f);
@@ -69,8 +73,10 @@ static void build_bg(const k64_mat4_t *viewproj, float aspect, float fade) {
     float d = k64_sqrtf(dx * dx / (rx * rx) + dy * dy / (ry * ry));
     if (d > far) far = d;
   }
+  // the outer ring is pushed out by the polygon's apothem and 8% to cover the corners
   far = far * 1.08f / k64_cosf(K64_PI / BG_SEG);
   if (far < 1.1f) far = 1.1f;
+  // ring radii (glow units) and the glow weight of each ring: only the inner ring glows
   const float ring[3] = { 0.45f, 1.f, far }, glow[3] = { 0.42f, 0, 0 };
   for (int i = 0; i < BG_NVTX; i++) {
     float x = gx, y = gy, g = 1;
@@ -83,6 +89,7 @@ static void build_bg(const k64_mat4_t *viewproj, float aspect, float fade) {
     }
     float t = (1 - y) * 0.5f;                      // 0 at the top, 1 at the bottom
     k64_vtx_t *v = &bg_vtx[i];
+    // NDC x 1024; bg_mtx scales them back and places them at the far plane
     v->x = (s16)(x * 1024); v->y = (s16)(y * 1024); v->z = 0; v->norm = 0;
     v->r = mix8(0, LOGO_BG[0][0] + (LOGO_BG[1][0] - LOGO_BG[0][0]) * t + LOGO_BG[2][0] * g, fade);
     v->g = mix8(0, LOGO_BG[0][1] + (LOGO_BG[1][1] - LOGO_BG[0][1]) * t + LOGO_BG[2][1] * g, fade);
@@ -92,6 +99,7 @@ static void build_bg(const k64_mat4_t *viewproj, float aspect, float fade) {
   k64_dcache_writeback(bg_vtx, sizeof bg_vtx);
 }
 
+// the background: Gouraud and z-buffered, no texture
 static void draw_bg(k64_kgfx_list_t *l) {
   k64_kgfx_geommode(l, K64_TRI_SHADE | K64_TRI_Z, 0, 0);
   k64_kgfx_mtx(l, &bg_mtx);
@@ -107,6 +115,7 @@ static void draw_bg(k64_kgfx_list_t *l) {
   }
 }
 
+// vertex colours: the silhouette colour blended to the lit colour by mix
 static void set_colors(float mix) {
   for (u32 i = 0; i < LOGO_NVTX; i++) {
     logo_vtx[i].r = mix8(LOGO_SIL[0], logo_rgb[i][0], mix);
@@ -116,6 +125,8 @@ static void set_colors(float mix) {
   k64_dcache_writeback(logo_vtx, sizeof logo_vtx);
 }
 
+// the bird in four parts: 0 body, 1 and 2 wings (hinged at LOGO_HINGE), 3 turned about LOGO_HIP
+// (tuck); each part has its own matrix and lights
 static void draw_bird(k64_kgfx_list_t *l, const k64_mat4_t *viewproj, const s16 *tr, float fade) {
   float R[3][3], S[3][3] = { { 0 } }, RS[3][3];
   quat_rot(R, tr);
@@ -133,6 +144,7 @@ static void draw_bird(k64_kgfx_list_t *l, const k64_mat4_t *viewproj, const s16 
   for (int k = 0; k < 3; k++) amb[k] = mix8(0, 255 + (LOGO_AMB[k] - 255) * lm, fade);
   static const float zaxis[3] = { 0, 0, 1 };
 
+  // lit, back faces culled
   k64_kgfx_geommode(l, K64_TRI_SHADE | K64_TRI_Z, 0, K64_KGFX_CULL_BACK | K64_KGFX_LIGHTING);
   u32 c = 0;
   for (u32 part = 0; part < 4; part++) {
@@ -154,6 +166,7 @@ static void draw_bird(k64_kgfx_list_t *l, const k64_mat4_t *viewproj, const s16 
     for (int k = 0; k < 3; k++) t[k] = RS[k][0] * q[0] + RS[k][1] * q[1] + RS[k][2] * q[2] + pos[k];
     k64_mat4_t model, rot, mvp;
     mat_from(&model, M, t);
+    // the lights see the rotation alone (normals: no scale, no translation)
     mat_from(&rot, RR, (const float[3]){ 0, 0, 0 });
     k64_mat4_mul(&mvp, viewproj, &model);
     k64_mtx_to_fixed(&part_ml[part].mtx, &mvp);
@@ -173,6 +186,7 @@ static void draw_bird(k64_kgfx_list_t *l, const k64_mat4_t *viewproj, const s16 
       }
     }
   }
+  // the RSP reads the matrices and lights from RDRAM
   k64_dcache_writeback(part_ml, sizeof part_ml);
 }
 
@@ -198,14 +212,18 @@ void k64_logo_play(void) {
   k64_dcache_writeback(&bg_mtx, sizeof bg_mtx);
 
   int width = have_font ? k64_font_width(&font, LOGO_TITLE) : 0;
+  // the animation runs on the count clock: frame = seconds x 60
   u32 start = k64_count();
   float skip_at = -1, last_fade = -1, last_mix = -1;
   for (;;) {
     float t = (float)(u32)(k64_count() - start) / K64_COUNT_HZ;
     u32 f = (u32)(t * 60);
     if (f >= LOGO_NFRAMES) break;
+    // track frame: quaternion 0..3, position 4..6 (1/4096), scale 7 and Z scale 8 (1/16384),
+    // wing angle 9 and tuck 10 (1/4096), colour mix 11, light 12, fade 13, title alpha 14
     const s16 *tr = logo_track[f];
     float fade = tr[13] / 255.f;
+    // skip: fade out over SKIP_FADE seconds, then the logo ends
     if (skip_at >= 0) {
       float k = 1 - (t - skip_at) / SKIP_FADE;
       if (k <= 0) break;
@@ -213,6 +231,7 @@ void k64_logo_play(void) {
     }
     k64_pad_poll_start();
     const k64_surface_t *fb = k64_display_acquire();
+    // background and colours are rebuilt only when their input changed
     if (fade != last_fade) build_bg(&viewproj, aspect, fade);
     float mix = tr[11] / 255.f;
     if (mix != last_mix) set_colors(mix);
@@ -232,9 +251,11 @@ void k64_logo_play(void) {
     k64_kgfx_run(&l);
     k64_kgfx_wait();
 
+    // the title follows the track's alpha, also faded out with the logo
     float ta = tr[14] / 255.f * fade;
     if (have_font && ta > 0) {
       u32 a = (u32)(ta * 255 + 0.5f);
+      // centred; it rises 3% of the screen height as it fades in
       int x = (320 - width) / 2, y = (int)(240 * LOGO_TITLE_Y + (1 - tr[14] / 255.f) * 240 * 0.03f);
       k64_font_set_palette(1, (LOGO_TITLE2_RGBA & ~0xFFu) | a);
       for (int d = 0; d < 2; d++)                  // twice, 1 px apart: a heavier weight
@@ -243,9 +264,11 @@ void k64_logo_play(void) {
     k64_pad_poll_end();
     k64_rdp_wait_idle();
     k64_display_show(fb);
+    // the first START, A or B press starts the fade-out
     if (skip_at < 0 && (k64_pads[0].pressed & (K64_PAD_START | K64_PAD_A | K64_PAD_B))) skip_at = t;
   }
   k64_rdp_wait_idle();
+  // forget the TMEM textures (the next user loads its own), then give the zones back
   k64_tex_tmem_forget();
   k64_mem_init();
 }

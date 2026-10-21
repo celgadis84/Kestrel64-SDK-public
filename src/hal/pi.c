@@ -3,9 +3,11 @@
 #include <k64/cpu.h>
 #include <k64/debug.h>
 
+// Starts a cart -> RDRAM DMA and returns without waiting. Writing PI_WR_LEN starts it; the length
+// register takes len - 1. The caller waits with k64_pi_wait().
 void k64_pi_read_async(void *dst, u32 rom_addr, u32 len) {
   K64_ASSERT(((u32)dst & 7) == 0 && (rom_addr & 1) == 0 && len && (len & 1) == 0);
-  k64_pi_wait();
+  k64_pi_wait();                               // one PI transfer at a time
   PI_DRAM_ADDR = K64_PHYS(dst);
   PI_CART_ADDR = K64_PHYS(rom_addr);
   PI_WR_LEN = len - 1;
@@ -20,5 +22,5 @@ void k64_pi_read(void *dst, u32 rom_addr, u32 len) {
   k64_dcache_invalidate(dst, len);
   k64_pi_read_async(dst, rom_addr, len);
   k64_pi_wait();
-  PI_STATUS = PI_WR_CLR_INTR;
+  PI_STATUS = PI_WR_CLR_INTR;                  // clear the PI interrupt flag the DMA raised
 }

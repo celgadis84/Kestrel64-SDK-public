@@ -3,6 +3,7 @@
 #include <k64/tpak.h>
 #include <k64/pak.h>
 
+// Transfer Pak registers (n64brew): power, bank select, access control, GB window.
 #define TP_POWER  0x8000
 #define TP_BANK   0xA000
 #define TP_ACCESS 0xB000
@@ -12,6 +13,7 @@
 
 static u8 tp_bank[4] = { 0xFF, 0xFF, 0xFF, 0xFF };   // bank last written per port (0xFF = unknown)
 
+// Writes one 32-byte block filled with v: the pak takes the register value from the block.
 static bool fill(int port, u16 addr, u8 v) {
   u8 b[32];
   for (int i = 0; i < 32; i++) b[i] = v;
@@ -20,6 +22,7 @@ static bool fill(int port, u16 addr, u8 v) {
 
 u8 k64_tpak_status(int port) {
   u8 b[32];
+  // Access register byte 0 holds the K64_TPAK_* status bits; 0 when the read fails.
   return k64_pak_read32(port, TP_ACCESS, b) ? b[0] : 0;
 }
 
@@ -48,7 +51,7 @@ void k64_tpak_stop(int port) {
 // Window address for GB address `a`, switching the pak bank when needed.
 static bool window(int port, u16 a, u16 *wa) {
   u8 bank = a >> 14;
-  if (tp_bank[port] != bank) {
+  if (tp_bank[port] != bank) {                 // only switch when the cached bank differs
     if (!fill(port, TP_BANK, bank)) { tp_bank[port] = 0xFF; return false; }
     tp_bank[port] = bank;
   }
@@ -108,6 +111,7 @@ static void classify(k64_gbcart_t *c) {
   u8 r = c->header[0x49];
   c->ram_size = r < 6 ? (u32)ram_kib[r] << 10 : 0;
   if (c->mbc == K64_GB_MBC2) c->ram_size = 512;
+  // Header 0x148: ROM size code, 32 KiB << n for n = 0..8.
   c->rom_size = c->header[0x48] <= 8 ? 0x8000u << c->header[0x48] : 0x8000u;
 }
 
@@ -115,10 +119,12 @@ k64_gb_err_t k64_gbcart_open(k64_gbcart_t *c, int port) {
   *c = (k64_gbcart_t){ .port = port };
   if ((unsigned)port > 3) return K64_GB_ERR_IO;
   if (!k64_tpak_start(port)) {
+    // Status set with PRESENT clear: the pak is there but has no cartridge.
     u8 st = k64_tpak_status(port);
     return st && !(st & K64_TPAK_PRESENT) ? K64_GB_ERR_NOCART : K64_GB_ERR_IO;
   }
   if (!k64_tpak_read(port, 0x100, c->header, sizeof c->header)) return K64_GB_ERR_IO;
+  // Header checksum over 0x134-0x14C (header offsets 0x34-0x4C), stored at 0x14D.
   u8 x = 0;
   for (int i = 0x34; i <= 0x4C; i++) x = (u8)(x - c->header[i] - 1);
   if (x != c->header[0x4D]) return K64_GB_ERR_HEADER;
@@ -127,7 +133,7 @@ k64_gb_err_t k64_gbcart_open(k64_gbcart_t *c, int port) {
   for (int i = 0; i < n; i++) c->title[i] = (char)c->header[0x34 + i];
   c->title[n] = 0;
   while (n && (c->title[n - 1] == 0 || c->title[n - 1] == ' ')) c->title[--n] = 0;
-  c->type = c->header[0x47];
+  c->type = c->header[0x47];                   // cartridge type, see classify()
   classify(c);
   return K64_GB_OK;
 }
@@ -165,6 +171,7 @@ bool k64_gbcart_read_rom(k64_gbcart_t *c, u32 offset, void *dst, u32 len) {
   if (offset + len > c->rom_size || offset + len < offset) return false;
   u8 *d = dst;
   while (len) {
+    // One 16 KiB ROM bank per step: map the bank, then read the part of it that is needed.
     u32 bank = offset >> 14, in = offset & 0x3FFF, n = 0x4000 - in < len ? 0x4000 - in : len;
     u16 base;
     if (!map_rom(c, bank, &base) || !k64_tpak_read(c->port, (u16)(base + in), d, n)) return false;
@@ -185,6 +192,7 @@ static bool map_ram(k64_gbcart_t *c, u32 bank) {
   }
 }
 
+// Save RAM in 8 KiB banks: each bank is mapped, then the part inside it is read or written.
 static bool ram_io(k64_gbcart_t *c, u32 offset, u8 *buf, u32 len, bool wr) {
   if (offset + len > c->ram_size || offset + len < offset) return false;
   bool ok = true;
@@ -208,6 +216,7 @@ bool k64_gbcart_write_ram(k64_gbcart_t *c, u32 offset, const void *src, u32 len)
   u8 blk[32];
   while (len) {
     u32 skew = offset & 31, n = 32 - skew < len ? 32 - skew : len;
+    // Partial 32-byte block: read it first so the bytes outside the range survive.
     if (n < 32 && !ram_io(c, offset - skew, blk, 32, false)) return false;
     for (u32 i = 0; i < n; i++) blk[skew + i] = s[i];
     if (!ram_io(c, offset - skew, blk, 32, true)) return false;

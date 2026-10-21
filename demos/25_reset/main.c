@@ -3,13 +3,13 @@
 // and shows how long the pre-NMI warning lasted, until the NMI restarts the ROM.
 #include <k64/k64.h>
 
-typedef struct { u32 magic, resets, last_warning_ms; } nmi_state_t;
-#define MAGIC 0x4B363452u   // "K64R"
+typedef struct { u32 signature, resets, last_warning_ms; } nmi_state_t;
+#define SIGNATURE 0x4B363452u   // "K64R"
 
 int main(void) {
   nmi_state_t *st = (nmi_state_t *)k64_reset_buffer();
   bool warm = k64_reset_warm();
-  if (!warm || st->magic != MAGIC) *st = (nmi_state_t){ .magic = MAGIC };
+  if (!warm || st->signature != SIGNATURE) *st = (nmi_state_t){ .signature = SIGNATURE };
   else st->resets++;
   k64_printf("[25_reset] %s boot, resets %u, last warning %u ms\n", warm ? "warm" : "cold",
              st->resets, st->last_warning_ms);

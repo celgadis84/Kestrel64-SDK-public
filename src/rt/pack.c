@@ -13,8 +13,9 @@
 
 #define CHUNK_MIN 1024u      // first PI DMA: small, so decoding starts early
 #define CHUNK_MAX 8192u      // later ones double up to this
-#define POLL      512u
+#define POLL      512u        // stream bytes between PI status checks (see set_lim)
 
+// 64-bit access that does not need 8-byte alignment: the fast paths run at any output offset.
 typedef u64 u64_un __attribute__((aligned(1), may_alias));
 
 typedef struct {
@@ -33,6 +34,7 @@ static void set_lim(src_t *s) {
   s->lim = s->dma_next == s->dma_end && !s->busy ? s->avail : s->in + (left > POLL ? POLL : left);
 }
 
+// Retires the finished DMA, if any, then starts the next chunk. avail moves to what has landed.
 static void kick(src_t *s) {
   if (s->busy) {
     if (k64_pi_busy()) return;
@@ -75,6 +77,7 @@ static inline void copy_fwd(u8 *d, const u8 *s, u32 n) {
   for (; n; n--) *d++ = *s++;
 }
 
+// LZ4 length extension: adds bytes until one is not 255.
 static u32 ext_len(src_t *s, u32 len) {
   u32 b;
   do {
@@ -85,6 +88,7 @@ static u32 ext_len(src_t *s, u32 len) {
   return len;
 }
 
+// Repeat step of a match with offset < 8: off * ceil(8 / off), the smallest multiple of off >= 8.
 static const u8 period8[8] = { 0, 8, 8, 9, 8, 10, 12, 14 };
 
 static inline void cpy8(u8 *d, const u8 *s) { *(u64_un *)d = *(const u64_un *)s; }
@@ -95,6 +99,7 @@ static inline void cpy8(u8 *d, const u8 *s) { *(u64_un *)d = *(const u64_un *)s;
 static void lz4(src_t *s, u8 *out, u8 *out_lim) {
   for (;;) {
     u32 t, lit;
+    // Fast literal path: token below 0xF0 (literals under 15), input and output room for the copy.
     if (K64_LIKELY(s->in + 20 <= s->lim && out <= out_lim) && (t = *s->in) < 0xF0) {
       // up to 14 literals: copy 16, keep lit
       lit = t >> 4;
@@ -117,8 +122,10 @@ static void lz4(src_t *s, u8 *out, u8 *out_lim) {
         lit -= k;
       }
     }
+    // A sequence with literals only ends the block: no offset follows.
     if (s->in == s->end) return;
     NEED(s, 2);
+    // Match offset, little-endian.
     u32 off = s->in[0] | s->in[1] << 8;
     s->in += 2;
     u32 ml = t & 15;
@@ -126,6 +133,7 @@ static void lz4(src_t *s, u8 *out, u8 *out_lim) {
     ml += 4;
     const u8 *m = out - off;
     u8 *e = out + ml;
+    // Short match at offset >= 8: up to three 8-byte copies, each source already written.
     if (K64_LIKELY(off >= 8 && ml <= 24 && out <= out_lim)) {
       cpy8(out, m);
       cpy8(out + 8, m + 8);
@@ -141,6 +149,7 @@ static void lz4(src_t *s, u8 *out, u8 *out_lim) {
       }
       for (; p < e; p += 8, m += 8) cpy8(p, m);
     } else {
+      // Near the end of the output: byte-exact copy, nothing written past e.
       for (u8 *p = out; p < e; ) *p++ = *m++;
     }
     out = e;
@@ -149,11 +158,13 @@ static void lz4(src_t *s, u8 *out, u8 *out_lim) {
 
 u32 k64_unpack(void *dst, const void *src) {
   const k64_pack_hdr_t *h = src;
-  K64_ASSERT(h->magic == K64_PACK_MAGIC);
+  K64_ASSERT(h->fourcc == K64_PACK_FOURCC);
   src_t s = {0};
   s.in = s.lim = s.avail = (const u8 *)(h + 1);
   s.end = s.in + h->packed_size;
+  // Whole stream already in RAM: no DMA, no limits.
   s.lim = s.avail = s.end;
+  // 24 bytes of slack at the end for the fast paths' overcopy.
   lz4(&s, dst, (u8 *)dst + h->raw_size - 24);
   return h->raw_size;
 }
@@ -161,10 +172,12 @@ u32 k64_unpack(void *dst, const void *src) {
 k64_pack_hdr_t k64_pack_info(u32 rom_addr) {
   k64_pack_hdr_t h K64_ALIGN(16);
   k64_pi_read(&h, rom_addr, sizeof h);
-  K64_ASSERT(h.magic == K64_PACK_MAGIC);
+  K64_ASSERT(h.fourcc == K64_PACK_FOURCC);
   return h;
 }
 
+// In-place decode of a ROM-resident stream: the stream sits at the top of dst while the output
+// grows up from its bottom, and the DMA runs ahead of the decoder.
 static u32 unpack_rom(void *dst, u32 rom_addr, const k64_pack_hdr_t *h) {
   K64_ASSERT(((u32)dst & 15) == 0);
   u32 padded = (h->packed_size + 7) & ~7u;
@@ -177,6 +190,7 @@ static u32 unpack_rom(void *dst, u32 rom_addr, const k64_pack_hdr_t *h) {
     .in = d, .avail = d, .end = d + h->packed_size,
     .dma_next = d, .dma_end = d + padded, .rom_next = rom_addr + sizeof *h, .chunk = CHUNK_MIN,
   };
+  // Start the first chunk; the decoder waits for it in refill().
   kick(&s);
   set_lim(&s);
   lz4(&s, dst, (u8 *)dst + h->raw_size - 24);

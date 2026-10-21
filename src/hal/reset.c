@@ -12,8 +12,11 @@ volatile u32 k64_reset_count;
 // Thread module, when linked: the mask every thread runs with.
 extern u32 k64_thread_im __attribute__((weak));
 
+// Unmasks IP4 (reset button) in the current SR and, when the thread module is linked, in the
+// mask every thread gets.
 void k64_reset_watch(void) {
   k64_irq_disable();
+  // The weak symbol's address is null when the thread module is not linked.
   if (&k64_thread_im) k64_thread_im |= SR_IM_PRENMI;
   k64_set_status(k64_status() | SR_IM_PRENMI);
   k64_irq_restore(1);
@@ -21,8 +24,10 @@ void k64_reset_watch(void) {
 
 bool k64_reset_pending(void) { return k64_reset_count != 0; }
 
+// Count ticks since the press; 0 when no press is pending.
 u32 k64_reset_elapsed(void) { return k64_reset_count ? k64_count() - k64_reset_count : 0; }
 
 bool k64_reset_warm(void) { return K64_BOOT_RESET != 0; }
 
+// osAppNMIBuffer: libultra's fixed address, 16 bytes past K64_BOOT_RESET (0x8000030C).
 u8 *k64_reset_buffer(void) { return (u8 *)0x8000031C; }

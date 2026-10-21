@@ -1,4 +1,8 @@
 build*/
 *.z64
 __pycache__/
+# PsyQ-derived (Sony library code): generated locally, never committed
+ports/psx/hle/psyq_gen.c
+ports/psx/tools/psyq/variants.pkl
+ports/psx/tools/psyq/sigs/
 !third_party/ipl3/ipl3_compat.z64

@@ -20,6 +20,7 @@ static const u8 zigzag[64] = {
   58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 };
 
+// big-endian reads of the header and the stream
 static u32 be32(const u8 *p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
 static u16 be16(const u8 *p) { return (u16)(p[0] << 8 | p[1]); }
 
@@ -69,6 +70,7 @@ bool k64_video_open(k64_video_t *v, u32 rom_addr) {
   v->next_size = be32(hdr + 32);
   u32 npred = be16(hdr + 26);
   v->max_aframes = be32(hdr + 36);
+  // packets follow the header and the VADPCM codebook (npred x 32 bytes)
   v->rom = rom_addr + HDR_SIZE + npred * 32;
   if (!v->width || (v->width | v->height) & 15 || !v->max_packet || v->max_packet & 15) return false;
   if (v->audio_rate && (npred < 1 || npred > 8)) return false;
@@ -106,8 +108,11 @@ bool k64_video_open(k64_video_t *v, u32 rom_addr) {
     v->arecs = grab(v, 8, (v->max_aframes / 16 + 3) * sizeof(k64_mixrec_t), 16);
     v->alist = (u64 *)(v->adec + 16);                  // after the 64-byte decoder block
     if (!v->pcm || !cb || !v->adec || !v->arecs || !v->alist) return false;
+    // the codebook is DMA'd in: drop cached lines of it first
     k64_dcache_invalidate(cb, npred * 32);
     if (!src_read(v, cb, rom_addr + HDR_SIZE, npred * 32)) return false;
+    // decoder block (kgfx.S adpcm): codebook, its length - 1 and self; state zero, slot 1 is the
+    // start state
     __builtin_memset(v->adec, 0, 64);
     v->adec[0] = K64_PHYS(cb);
     v->adec[1] = npred * 32 - 1;
@@ -129,12 +134,14 @@ static u8  lz8[256];          // leading zeros of a byte (8 for 0)
 static u16 tok9[512];         // token {ue(run), ue(|level| - 1), sign} in the next 9 bits:
                               // len | run << 4 | (|level| - 1) << 8 | sign << 12, 0 if longer
 
+// the 8 bytes at bit position pos, shifted so that bit pos is the MSB
 static inline u64 peek(const u8 *b, u32 pos) {
   u64 x;
   __builtin_memcpy(&x, b + (pos >> 3), 8);       // big-endian
   return x << (pos & 7);
 }
 
+// reads n bits (n <= 32) and advances
 static inline u32 getbits(k64_video_t *v, int n) {
   u32 r = (u32)(peek(v->bits, v->pos) >> (64 - n));
   v->pos += n;
@@ -152,6 +159,7 @@ static inline s32 ue_x(u64 x, u32 *n) {
   return (s32)(x >> (63 - 2 * z)) - 1;
 }
 
+// unsigned Exp-Golomb at the bit position
 static inline s32 ue(k64_video_t *v) {
   u32 n = 0;
   s32 r = ue_x(peek(v->bits, v->pos), &n);
@@ -165,6 +173,7 @@ static inline s32 se(k64_video_t *v) {
   return k & 1 ? (k + 1) >> 1 : -(k >> 1);
 }
 
+// builds lz8 and tok9 (once, at the first parse)
 static void tables(void) {
   for (int i = 0; i < 256; i++) {
     int z = 0;
@@ -184,9 +193,11 @@ static void tables(void) {
 bool k64_video_parse_begin(k64_video_t *v, const u8 *bits, u32 len, bool *is_p) {
   if (!lz8[0]) tables();
   v->bits = bits; v->pos = 0; v->nbits = len * 8;
+  // frame header: P flag, then the 5-bit quantiser (0 is invalid)
   v->is_p = getbits(v, 1);
   u32 q = getbits(v, 5);
   if (!q) return false;
+  // dequantiser per natural-order coefficient: q x (8 + row + col)
   for (int i = 0; i < 64; i++) v->step[i] = (u16)(q * (8 + (i >> 3) + (i & 7)));
   if (is_p) *is_p = v->is_p;
   v->prow = 0;
@@ -197,16 +208,19 @@ u32 k64_video_parse_row(k64_video_t *v, u16 *w) {
   u16 *w0 = w;
   s32 row = v->prow++, pdx = 0, pdy = 0;
   for (u32 mx = 0; mx < v->width / 16u; mx++) {
+    // skip, inter, intra or motion (always intra in I frames)
     s32 mode = v->is_p ? ue(v) : K64V_INTRA;
     if (mode < 0 || mode > K64V_MOTION) return 0;
     if (mode == K64V_SKIP) { *w++ = K64V_SKIP; pdx = pdy = 0; continue; }
     u16 *head = w++;
     if (mode == K64V_MOTION) {
       // Vector predicted from the macroblock to the left (if it moved); source in the frame.
+      // motion vector: differential to the previous macroblock's vector (zero after one without)
       s32 dx = pdx + se(v), dy = pdy + se(v);
       s32 sx = (s32)mx * 16 + dx, sy = row * 16 + dy;
       if (sx < 0 || sx > v->width - 16 || sy < 0 || sy > v->height - 16) return 0;
       u32 yo = (u32)sy * v->width + (u32)sx;
+      // chroma source: half the vector, in the 8x8 chroma plane
       u32 co = (u32)(row * 8 + (dy >> 1)) * (v->width / 2u) + mx * 8 + (u32)(dx >> 1);
       *w++ = (u16)(yo >> 16); *w++ = (u16)yo;
       *w++ = (u16)(co >> 16); *w++ = (u16)co;
@@ -214,6 +228,7 @@ u32 k64_video_parse_row(k64_video_t *v, u16 *w) {
     } else {
       pdx = pdy = 0;
     }
+    // coded block pattern: one bit per block, Y0..Y3, U, V (bit 5 = Y0)
     u32 cbp = getbits(v, 6);
     *head = (u16)(mode | cbp << 2);
     const u8 *bits = v->bits;
@@ -221,6 +236,7 @@ u32 k64_video_parse_row(k64_video_t *v, u16 *w) {
     for (int k = 0; k < 6; k++) {
       if (!(cbp & (0x20u >> k))) continue;
       u32 len = 0;
+      // coefficient count: 1 + ue
       s32 n = ue_x(peek(bits, pos), &len) + 1;
       pos += len;
       if (n <= 0 || n > 64) return 0;
@@ -228,6 +244,7 @@ u32 k64_video_parse_row(k64_video_t *v, u16 *w) {
       s32 i = -1;
       while (n--) {
         u64 x = peek(bits, pos);
+        // a token of up to 9 bits is one lookup (run, level, sign); 0 means a long token
         u32 e = tok9[x >> 55];
         s32 run, lv;
         if (e) {
@@ -248,8 +265,10 @@ u32 k64_video_parse_row(k64_video_t *v, u16 *w) {
         }
         i += run + 1;
         if (i > 63) return 0;
+        // runs count positions in zigzag order; nat is the natural index of that position
         u32 nat = zigzag[i];
         s32 c = lv * v->step[nat];
+        // pair: natural index, then the dequantised value (saturated)
         *w++ = (u16)nat;
         *w++ = (u16)(s16)(c > 32767 ? 32767 : c < -32768 ? -32768 : c);
       }
@@ -260,8 +279,10 @@ u32 k64_video_parse_row(k64_video_t *v, u16 *w) {
   return v->pos <= v->nbits ? (u32)(w - w0) : 0;
 }
 
+// Starts kvid on one macroblock row: its RDRAM addresses go to DMEM; k64_rsp_run is asynchronous.
 static void rsp_row(k64_video_t *v, const u16 *work, u32 row, u32 fb_row) {
   u32 w = v->width;
+  // fb_row: surface row for the RSP's colour conversion (0: the frame is not drawn by the RSP)
   k64_dmem_write(KVID_FB, fb_row ? fb_row + row * 16 * k64_dmem_read(KVID_FBSTRIDE) : 0);
   k64_dmem_write(KVID_WORK, K64_PHYS(work));
   k64_dmem_write(KVID_YROW, K64_PHYS(v->y + row * 16 * w));
@@ -281,7 +302,7 @@ static void audio_decode(k64_video_t *v, const u8 *f, u32 naf) {
   v->a_first = v->pcm_wr;
   v->a_count = 0;
   u32 n = naf * 16, room = (v->pcm_rd + v->pcm_len - v->pcm_wr - 1) % v->pcm_len;
-  if (!naf || n > room) return;                   // ring full: drop (the state carries on)
+  if (!naf || n > room) return;                   // ring full: drop it (the decoder state does not advance)
   k64_mixrec_t *r = v->arecs;
   u32 wr = v->pcm_wr, in = v->aslot;
   while (naf) {
@@ -333,22 +354,27 @@ bool k64_video_decode(k64_video_t *v, const k64_surface_t *fb, int x, int y) {
   if (v->frame >= v->frames || !v->next_size) return false;
   u32 size = v->next_size;
   u8 *p = v->pkt[v->cur];
+  // the packet was prefetched by PI DMA, or is read now from the source
   if (v->prefetching) {
     k64_pi_wait();
     v->prefetching = false;
   } else if (!src_read(v, p, v->rom, size)) {
     return false;
   }
+  // packet header: next packet size, bit count, audio frames, the two CRCs
   v->next_size = be32(p);
   u32 nbits = be32(p + 4), naf = be32(p + 8);
   v->crc = be32(p + 12);
   v->acrc = be32(p + 16);
+  // audio bytes: 9 per VADPCM frame, padded to 16
   u32 abytes = (naf * 9 + 15) & ~15u;
+  // reject a corrupt or inconsistent packet
   if (v->next_size > v->max_packet || naf > v->max_aframes || (naf && !v->pcm) ||
       32 + abytes + nbits > size)
     return false;
 
   // Start fetching the next packet into the other buffer while this one decodes.
+  // prefetch the next packet into the other buffer, overlapped with this frame's work
   v->rom += size;
   if (v->next_size && !v->read) {
     u8 *q = v->pkt[v->cur ^ 1];
@@ -357,6 +383,7 @@ bool k64_video_decode(k64_video_t *v, const k64_surface_t *fb, int x, int y) {
     v->prefetching = true;
   }
 
+  // audio first: this packet's samples go into the ring
   u32 ta = k64_count();
   audio_decode(v, p + 32, naf);
   v->t_audio = k64_count() - ta;
@@ -367,9 +394,11 @@ bool k64_video_decode(k64_video_t *v, const k64_surface_t *fb, int x, int y) {
   t = v->u; v->u = v->ru; v->ru = t;
   t = v->v; v->v = v->rv; v->rv = t;
 
+  // the coefficient bitstream follows the audio
   const u8 *bits = p + 32 + abytes;
   u32 t0 = k64_count(), tp = 0;
   bool ok = k64_video_parse_begin(v, bits, nbits, NULL), busy = false;
+  // RSP: load kvid on demand (it replaces the microcode in IMEM), point it at the references
   if (!v->use_cpu) {
     if (k64_rsp_loaded != kvid_text) {
       k64_ucode_t u = K64_UCODE(kvid);
@@ -381,6 +410,8 @@ bool k64_video_decode(k64_video_t *v, const k64_surface_t *fb, int x, int y) {
     k64_dmem_write(KVID_RVBASE, K64_PHYS(v->rv));
   }
   // RSP colour conversion: the frame inside the surface, DMA-aligned.
+  // RSP colour conversion needs a 16bpp surface, x a multiple of 4, a DMA-aligned pitch and the
+  // frame inside the surface
   bool rsp_fb = fb && !v->use_cpu && fb->bpp == K64_BPP16 && x >= 0 && y >= 0 && !(x & 3) &&
                 !(fb->stride & 7) && x + v->width <= fb->width && y + v->height <= fb->height;
   u32 fb_row = 0;
@@ -400,15 +431,20 @@ bool k64_video_decode(k64_video_t *v, const k64_surface_t *fb, int x, int y) {
       k64_video_reconstruct_cpu(v, w, row);
       continue;
     }
+    // the RSP reads the work list from RDRAM
     k64_dcache_writeback(w, n * 2);
+    // the previous row's RSP run must finish before the next starts; the bound makes a hung RSP
+    // fail the frame
     if (busy && !k64_rsp_wait(10000000)) { ok = false; break; }
     rsp_row(v, w, row, fb_row);
     busy = true;
   }
   if (busy) {
     if (!k64_rsp_wait(10000000)) ok = false;
+    // the RSP wrote the planes: drop the CPU's stale lines before reading them
     k64_dcache_invalidate(v->y, (u32)v->width * v->height * 3 / 2);
   }
+  // the CPU colour conversion, when the RSP did not draw the frame
   if (ok && fb && !rsp_fb) k64_video_blit(v, fb, x, y);
   v->t_parse = tp;
   v->t_recon = k64_count() - t0 - tp;
@@ -428,6 +464,7 @@ void k64_video_audio(k64_video_t *v) {
   while ((buf = k64_audio_next()) != NULL) {
     u32 n = k64_audio_frames();
     for (u32 i = 0; i < n; i++) {
+      // one sample per frame from the ring (both channels); silence when it is empty
       s16 s = 0;
       if (v->pcm && v->pcm_rd != v->pcm_wr) {
         s = v->pcm[v->pcm_rd];
@@ -435,6 +472,7 @@ void k64_video_audio(k64_video_t *v) {
       }
       buf[2 * i] = buf[2 * i + 1] = s;
     }
+    // the AI DMA reads the buffer from RDRAM
     k64_dcache_writeback(buf, n * 4);
     k64_audio_submit(buf);
   }

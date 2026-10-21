@@ -10,6 +10,7 @@ _Static_assert(RDP_BLOCKS * RDP_BLOCK_WORDS * 8 == K64_RDP_RING_BYTES, "ring siz
 
 k64_rdp_stream_t k64_rdp;
 k64_rdp_state_t  k64_rdps;
+// CPU pointer to each ring block; set by k64_rdp_init_at.
 static u64 *blocks[RDP_BLOCKS];
 static bool block_started;            // DPC_START issued for the current block
 
@@ -25,8 +26,10 @@ void k64_rdp_init_at(void *mem) {
   k64_rdp.block = k64_rdp.cur = k64_rdp.sent = k64_rdp.lim = blocks[0];
   k64_rdp.end = blocks[0] + RDP_BLOCK_WORDS;
   block_started = false;
+  // Reset the RDP interface (XBUS, freeze, flush) and the MI DP interrupt before first use.
   DPC_STATUS = DPC_WR_CLR_XBUS | DPC_WR_CLR_FREEZE | DPC_WR_CLR_FLUSH;
   MI_MODE = MI_MODE_CLR_DP;
+  // Cached RDP state starts as unknown (all ones / 0xDEADBEEF) so the first setter always emits.
   k64_rdps = (k64_rdp_state_t){ .other_modes = ~0ull, .combine = ~0ull,
     .fill_color = 0xDEADBEEF, .prim_color = 0xDEADBEEF, .env_color = 0xDEADBEEF,
     .blend_color = 0xDEADBEEF, .fog_color = 0xDEADBEEF };
@@ -35,7 +38,9 @@ void k64_rdp_init_at(void *mem) {
 void k64_rdp_flush(void) {
   u64 *a = k64_rdp.sent, *b = k64_rdp.cur;
   if (a == b) return;
+  // The RDP reads RDRAM: write back the CPU's commands in [sent, cur) first.
   k64_dcache_writeback(a, (u32)((u8*)b - (u8*)a));
+  // One DPC_START per block; later flushes only extend DPC_END while the RDP is reading.
   if (!block_started) {
     while (DPC_STATUS & DPC_ST_START_VALID) {}       // previous START not consumed yet
     DPC_START = K64_PHYS(a);
@@ -63,11 +68,13 @@ void k64_rdp_overflow(void) {
 #define RDP_AHEAD_LINES 4             // lines prepared per k64_rdp_more
 
 void k64_rdp_more(u32 n) {
+  // Not enough room left in this block for n words: move on to the next ring block.
   if (k64_rdp.cur + n > k64_rdp.end) k64_rdp_overflow();
   // Lines from the first one not prepared yet up to past cur + n, a few ahead, within the block
   u32 a = ((u32)(k64_rdp.lim > k64_rdp.cur ? k64_rdp.lim : k64_rdp.cur) + 15) & ~15u;
   u32 to = ((u32)(k64_rdp.cur + n) + RDP_AHEAD_LINES * 16 - 1) & ~15u;
   if (to > (u32)k64_rdp.end) to = (u32)k64_rdp.end;
+  // Create-dirty claims each line without reading RDRAM: the commands overwrite all of it.
   for (; a < to; a += 16) K64_CACHE_OP(K64_D_CREATE_DIRTY, a);
   k64_rdp.lim = (u64 *)to;
 }
@@ -103,6 +110,7 @@ bool k64_rdp_busy(void) {
 }
 
 void k64_rdp_wait_idle(void) {
+  // SYNC_FULL raises the DP interrupt once the RDP has drained everything queued so far.
   k64_rdp_put(k64_rdpc_sync_full());
   k64_rdps.prim_pending = k64_rdps.tile_pending = k64_rdps.load_pending = false;
   k64_rdp_flush();
@@ -123,6 +131,7 @@ u32 k64_rdp_clock(void) { return DPC_CLOCK & 0xFFFFFF; }
 void k64_rdp_attach(u32 fmt, u32 siz, u32 width, u32 height, void *color, void *z) {
   k64_rdp_pipe_guard();
   u32 c = K64_PHYS(color);
+  // Re-emit the image setters only when the address changed (cached state).
   if (c != k64_rdps.color_image) { k64_rdp_put(k64_rdpc_color_image(fmt, siz, width, c)); k64_rdps.color_image = c; }
   k64_rdps.att_fmt = fmt; k64_rdps.att_siz = siz; k64_rdps.att_w = width; k64_rdps.att_h = height;
   if (z) {
@@ -139,6 +148,7 @@ void k64_rdp_clear(u32 fill, bool clear_z) {
     // Z buffer is a 16-bit image: draw into it as a color image with the max depth value.
     k64_rdp_pipe_guard();
     k64_rdp_put(k64_rdpc_color_image(K64_FMT_RGBA, K64_SIZ_16, w, k64_rdps.z_image));
+    // 0xFFFC is the far depth in the RDP's Z encoding, in both 16-bit halves of the fill word.
     k64_rdp_set_fill_color(0xFFFCFFFC);
     k64_rdp_fill_rect(0, 0, w, h);
     k64_rdp_pipe_guard();

@@ -28,11 +28,13 @@ void k64_mem_init(void) {
 
 u32 k64_mem_total(void) { return rdram_size; }
 
+// Bump allocation from the bottom of [*lo, hi). Returns 0 when the block does not fit.
 static void *up(u32 *lo, u32 hi, u32 size, u32 align) {
   u32 p = (*lo + align - 1) & ~(align - 1);
   if (p < *lo || p + size > hi) return 0;
   *lo = p + size; return (void*)p;
 }
+// Bump allocation from the top of [lo, *hi): the heap side of bank 3, facing Z.
 static void *down(u32 lo, u32 *hi, u32 size, u32 align) {
   if (*hi - lo < size) return 0;
   u32 p = (*hi - size) & ~(align - 1);
@@ -81,6 +83,7 @@ u32 k64_mem_largest_free(k64_zone_t zone) {
     case K64_ZONE_HEAP: r[0] = xp_hi - xp_lo; r[1] = b3_hi - b3_lo; r[2] = b0_hi - b0_lo; break;
     default: return 0;
   }
+  // Each region is contiguous and a single allocation cannot span two of them: take the max.
   for (int i = 0; i < 3; i++) if (r[i] > m) m = r[i];
   return m & ~15u;
 }
@@ -98,6 +101,7 @@ void k64_arena_init(k64_arena_t *a, void *mem, u32 size) {
 // ---- MI repeat fill -----------------------------------------------------------------------
 #include <k64/cpu.h>
 
+// Byte stores through the D$: byte at p takes lane (p & 3) of the big-endian word `value`.
 static void fill_cached(u8 *p, u32 value, u32 len) {
   for (; len; len--, p++) *p = (u8)(value >> (24 - 8 * ((u32)p & 3)));
 }
@@ -106,20 +110,23 @@ void k64_mem_fill(void *dst, u32 value, u32 len) {
   u8 *p = dst, *end = p + len;
   u8 *a = (u8 *)(((u32)p + 15) & ~15u), *b = (u8 *)((u32)end & ~15u);
   if (b <= a) { fill_cached(p, value, len); return; }
+  // Partial lines at either end: ordinary cached stores.
   fill_cached(p, value, (u32)(a - p));
   fill_cached(b, value, (u32)(end - b));
   // The whole lines are about to be overwritten in RDRAM: drop them from D$ (nothing of them
   // is kept, so no write-back), then one aligned uncached store per <= 128 bytes. Aligned to
   // 16 so no transfer hits the RI's unaligned-carry bug.
   k64_dcache_invalidate(a, (u32)(b - a));
+  // Uncached alias: the repeated store must go to RDRAM, not into the D$.
   volatile u32 *u = K64_KSEG1(a);
   for (u32 left = (u32)(b - a); left;) {
     u32 ie = k64_irq_disable();                   // 16 transfers (2 KB) per masked stretch
     for (int k = 0; k < 16 && left; k++) {
       u32 n = left > 128 ? 128 : left;
+      // Repeat mode: the store below is repeated over n bytes (field = n - 1, see hw.h).
       MI_MODE = MI_MODE_SET_REPEAT | (n - 1);
       *u = value;
-      u += n / 4;
+      u += n / 4;                                 // u32 pointer: n / 4 words = n bytes
       left -= n;
     }
     k64_irq_restore(ie);

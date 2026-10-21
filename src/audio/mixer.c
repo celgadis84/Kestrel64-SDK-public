@@ -18,9 +18,10 @@
 #include <k64/k64.h>
 
 #define SRCBUF_BYTES 0x460                     // RSP source buffer (kgfx.S SRCBUF)
-#define ADPCM_GROUPS (K64_ADPCM_RING / K64_ADPCM_GROUP)
-#define ADPCM_GFRAMES (K64_ADPCM_GROUP / 16)
+#define ADPCM_GROUPS (K64_ADPCM_RING / K64_ADPCM_GROUP)   // decode groups in a voice's ring
+#define ADPCM_GFRAMES (K64_ADPCM_GROUP / 16)              // 16-frame records per group
 
+// big-endian u32 at p
 static u32 be32(const u8 *p) { return (u32)p[0] << 24 | (u32)p[1] << 16 | (u32)p[2] << 8 | p[3]; }
 
 bool k64_adpcm_load(k64_adpcm_t *a, const void *blob) {
@@ -30,6 +31,7 @@ bool k64_adpcm_load(k64_adpcm_t *a, const void *blob) {
   a->nframes = be32(b + 16); a->npred = be32(b + 20);
   a->codebook = (const s16 *)(b + be32(b + 24));
   a->frames = b + be32(b + 28);
+  // loop state: 8 big-endian s16 right after the 32-byte header
   for (u32 i = 0; i < 8; i++) a->loop_state[i] = (s16)(b[32 + i * 2] << 8 | b[33 + i * 2]);
   return true;
 }
@@ -58,12 +60,16 @@ void k64_voice_play_adpcm(k64_voice_t *v, k64_adpcm_voice_t *d, const k64_adpcm_
   d->codebook_len1 = a->npred * 32 - 1;
   d->mirror = K64_PHYS(&d->ring[K64_ADPCM_RING]);
   d->self = K64_PHYS(d);
+  // slot 0 is the loop state; the group slots are written before they are read
   for (u32 k = 0; k < 8; k++) {
     d->state[0][k] = a->loop_state[k];
     for (u32 g = 1; g <= ADPCM_GROUPS; g++) d->state[g][k] = 0;
   }
+  // the first record reads slot 1 (the zero start state); the list builder checks no restart
+  // happens inside one list (starts)
   d->a = a; d->dec = 0; d->src = 0; d->rd = 0; d->in = 1; d->ended = false;
   d->starts++;
+  // header and state only: the ring is filled by the decoder later
   k64_dcache_writeback(d, (u32)((u8 *)d->ring - (u8 *)d));
   k64_voice_play(v, d->ring, K64_ADPCM_RING, 0, step, vol_l, vol_r);
   v->adpcm = d;
@@ -83,21 +89,26 @@ static u32 adpcm_records(k64_adpcm_voice_t *d, k64_mixrec_t *r, u32 cap, u32 nee
   const k64_adpcm_t *a = d->a;
   u32 nr = 0, groups = 0;
   while (d->dec < need) {
+    // g: ring group being decoded; next: state slot before the group after it
     u32 g = d->dec / K64_ADPCM_GROUP % ADPCM_GROUPS, next = 1 + (g + 1) % ADPCM_GROUPS;
     s16 *o = &d->ring[g * K64_ADPCM_GROUP];
     u32 left = ADPCM_GFRAMES;
     while (left && !d->ended) {
       if (d->src == a->nframes) {
         if (a->loop_start == K64_NO_LOOP) { d->ended = true; break; }
+        // loop: the rest is decoded from the loop point, starting from the loop state (slot 0)
         d->src = a->loop_start / 16;
         d->in = 0;
       }
+      // frames of this record; last: it completes the group, so the state after it is stored
       u32 k = a->nframes - d->src < left ? a->nframes - d->src : left;
       bool last = k == left;
       K64_ASSERT(nr < cap);
+      // decode record, layout as read by adpcm_cpu
       r[nr++] = (k64_mixrec_t){ .w = { 2, (k - 1) << 24 | K64_PHYS(a->frames + d->src * 9),
         (u32)(o == d->ring) << 31 | (last ? next : 0) << 24 | K64_PHYS(o),
         (u32)d->in << 24 | K64_PHYS(d) } };
+      // after a loop split the next record starts from the loop state (slot 0), else from next
       d->in = last ? next : 0;
       d->src += k;
       o += k * 16;
@@ -123,6 +134,7 @@ static u32 voice_records(k64_voice_t *v, k64_mixrec_t *r, u32 cap, u32 start, u3
       end = (u64)(v->idx + v->left) << 16;
       fin = true;
     }
+    // frames before the position reaches end
     u32 nmax = (u32)((end - p0 - 1) / v->step) + 1;
     u32 count = n < nmax ? n : nmax;
     s32 dl = 0, dr = 0;
@@ -133,6 +145,7 @@ static u32 voice_records(k64_voice_t *v, k64_mixrec_t *r, u32 cap, u32 start, u3
     }
     u32 last = (u32)(((u32)v->frac + (count - 1) * v->step) >> 16) + 1;  // highest sample read
     u32 src = K64_PHYS(&v->data[v->idx]);
+    // RDRAM the RSP fetches: from src's 8-byte line through the last sample
     u32 bytes = (src & 7) + (last + 1) * 2;
     K64_ASSERT(bytes <= SRCBUF_BYTES && nr + 1 < cap);
     if (dl | dr) r[nr++] = (k64_mixrec_t){ .w = { 3, (u32)(u16)dl << 16 | (u16)dr } };
@@ -147,10 +160,12 @@ static u32 voice_records(k64_voice_t *v, k64_mixrec_t *r, u32 cap, u32 start, u3
       if (!v->ramp) { v->vol_l = v->tgt_l; v->vol_r = v->tgt_r; }
     }
     if (v->adpcm) {
+      // the decoder follows the voice position (rd is a stream sample index)
       u32 adv = (u32)(p >> 16) - v->idx;
       v->adpcm->rd += adv;
       if (oneshot) v->left -= adv;
     }
+    // end reached: a one-shot stops; a loop wraps back into its loop by the loop length
     if (p >= end) {
       if (fin) { v->on = false; break; }
       u64 span = (u64)(v->len - v->loop_start) << 16;
@@ -187,19 +202,23 @@ u32 k64_mixer_build_ex(k64_mixer_t *m, k64_mixrec_t *recs, u32 cap, s16 *out, u3
         dv[i] = v->adpcm; dec0[i] = v->adpcm->dec; gen[i] = v->adpcm->starts;
       }
       K64_ASSERT(gen[i] == v->adpcm->starts);
+      // decode up to the samples this block reads (+1: the interpolation neighbour)
       u32 last = (u32)(((u64)v->frac + (u64)(n - 1) * v->step) >> 16) + 1;
       nd += adpcm_records(v->adpcm, dec_recs + nd, K64_ARRAY_LEN(dec_recs) - nd, v->adpcm->rd + last + 1);
     }
     for (u32 i = 0; i < K64_MIXER_VOICES; i++)
       if (m->v[i].on) nr += voice_records(&m->v[i], recs + nr, cap - nr, 0, n);
     K64_ASSERT(nr < cap);
+    // BLOCK: the block's n frames are written to out + b (after its voice records)
     recs[nr++] = (k64_mixrec_t){ .src = 0, .step = K64_PHYS(out + b * 2), .frac = (u16)n };
   }
   // one list may not decode over a slot it reads
   for (u32 i = 0; i < K64_MIXER_VOICES; i++)
     if (dv[i]) K64_ASSERT((dv[i]->dec - dec0[i]) / K64_ADPCM_GROUP < ADPCM_GROUPS);
   K64_ASSERT(nr < cap);
+  // END of the mix records (decode records, if any, go in front of them below)
   recs[nr++] = (k64_mixrec_t){ .src = 1 };
+  // decode records in front, each group of them ended by an END (k64_adpcm_run_cpu stops there)
   if (nd) {
     K64_ASSERT(nr + nd + 1 <= cap);
     for (u32 i = nr; i--;) recs[i + nd + 1] = recs[i];
@@ -215,6 +234,7 @@ u32 k64_mixer_build(k64_mixer_t *m, k64_mixrec_t *recs, u32 cap, s16 *out, u32 f
   return k64_mixer_build_ex(m, recs, cap, out, frames, NULL, NULL);
 }
 
+// saturate to s16
 static inline s16 clamp16(s32 x) { return x > 32767 ? 32767 : x < -32768 ? -32768 : (s16)x; }
 
 void k64_kgfx_audio(k64_kgfx_list_t *l, const k64_mixrec_t *recs) {
@@ -227,6 +247,8 @@ void k64_kgfx_audio(k64_kgfx_list_t *l, const k64_mixrec_t *recs) {
 }
 
 // CPU reference of one decode record (kgfx.S adpcm overlay).
+// (record words: w[1] = frames - 1 << 24 | input address; w[2] = mirror flag << 31 |
+// state slot to store << 24 | output address; w[3] = input slot << 24 | voice address)
 static void adpcm_cpu(const k64_mixrec_t *r) {
   k64_adpcm_voice_t *d = K64_KSEG0(r->w[3] & 0x00FFFFFF);
   const u8 *f = K64_KSEG0(r->w[1] & 0x00FFFFFF);
@@ -237,28 +259,36 @@ static void adpcm_cpu(const k64_mixrec_t *r) {
   for (u32 k = 0; k < 8; k++) s[k] = d->state[in][k];
   for (; n; n--, f += 9) {
     const s16 *p0 = cb + (f[0] & 15) * 16, *p1 = p0 + 8;
-    s32 res[16];
+    s32 resid[16];
     for (u32 j = 0; j < 16; j++) {
       s32 nib = j & 1 ? f[1 + j / 2] & 15 : f[1 + j / 2] >> 4;
-      res[j] = clamp16(((nib ^ 8) - 8) << (f[0] >> 4));
+      // 4-bit two's complement residual (sign by xor/subtract), scaled by the frame's shift
+      resid[j] = clamp16(((nib ^ 8) - 8) << (f[0] >> 4));
     }
     for (u32 h = 0; h < 2; h++) {
-      const s32 *rr = res + h * 8;
+      const s32 *rrow = resid + h * 8;
       for (u32 j = 0; j < 8; j++) {
-        s32 sum = p0[j] * s[6] + p1[j] * s[7] + rr[j] * 2048;
-        for (u32 k = 0; k < j; k++) sum += rr[k] * p1[j - k - 1];
+        // order-2 prediction from the last two samples (s[6], s[7]) through the codebook rows,
+        // plus the residual (Q11, hence the shift below)
+        s32 sum = p0[j] * s[6] + p1[j] * s[7] + rrow[j] * 2048;
+        // the residuals already in this half-frame, through the second row
+        for (u32 k = 0; k < j; k++) sum += rrow[k] * p1[j - k - 1];
         o[j] = clamp16(sum >> 11);
       }
+      // the 8 new samples are the history for the next half-frame
       for (u32 k = 0; k < 8; k++) s[k] = o[k];
       o += 8;
     }
   }
+  // the RSP and the mixer read the decoded samples from RDRAM
   k64_dcache_writeback(o0, (u32)(o - o0) * 2);
+  // guard copy: the ring's first 16 samples are repeated past its end (interpolation)
   if (r->w[2] >> 31) {
     s16 *mir = K64_KSEG0(d->mirror);
     for (u32 k = 0; k < 16; k++) mir[k] = o0[k];
     k64_dcache_writeback(mir, 32);
   }
+  // the state after this record, for the next one (slot out)
   if (out) {
     for (u32 k = 0; k < 8; k++) d->state[out][k] = s[k];
     k64_dcache_writeback(d->state[out], 16);
@@ -285,7 +315,9 @@ void k64_mixer_run_cpu(const k64_mixrec_t *r) {
   s32 dl = 0, dr = 0;
   for (;; r++) {
     if (r->src == 1) return;
+    // RAMP: per-frame volume step for the next voice record
     if (r->src == 3) { dl = (s16)(r->w[1] >> 16); dr = (s16)r->w[1]; continue; }
+    // BLOCK: copy the mixed frames out and clear the accumulator
     if (r->src == 0) {
       s16 *out = K64_KSEG0(r->step);
       for (u32 i = 0; i < r->frac * 2u; i++) { out[i] = blk[i]; blk[i] = 0; }
@@ -295,14 +327,17 @@ void k64_mixer_run_cpu(const k64_mixrec_t *r) {
     const s16 *s = K64_KSEG0(r->src & 0x00FFFFFF);
     u32 p = r->frac;
     for (u32 f = r->start; f <= (u32)r->start + r->count1; f++, p += r->step) {
+      // 16.16 position: integer sample index and fraction (linear interpolation)
       u32 i = p >> 16, x = p & 0xFFFF;
       s32 v = (s32)(((s64)s[i] * 65536 + (s64)(s[i + 1] - s[i]) * (s32)x) >> 16);
       s32 vl = r->vol_l + (s32)(f - r->start) * dl, vr = r->vol_r + (s32)(f - r->start) * dr;
+      // Q15 volume as vmulf, then the saturating sum into the block
       s32 tl = clamp16((s32)(((s64)v * vl * 2 + 0x8000) >> 16));
       s32 tr = clamp16((s32)(((s64)v * vr * 2 + 0x8000) >> 16));
       blk[f * 2]     = clamp16(blk[f * 2] + tl);
       blk[f * 2 + 1] = clamp16(blk[f * 2 + 1] + tr);
     }
+    // a RAMP applies to the next voice record only
     dl = dr = 0;
   }
 }

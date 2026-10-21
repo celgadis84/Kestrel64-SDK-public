@@ -8,12 +8,15 @@
 
 #define CMD_READ  0x02
 #define CMD_WRITE 0x03
+// Register addresses; addr_crc() adds the 5-bit checksum before they go on the wire.
 #define ADDR_PROBE  0x8000      // accessory identification register
 #define ADDR_MOTOR  0xC000
 #define PROBE_RUMBLE    0x80
 #define PROBE_TPAK_ON   0x84
 #define PROBE_TPAK_OFF  0xFE
 
+// 5-bit checksum of the upper 11 address bits, taken from the per-bit table x[]; the low 5 bits
+// of the input are ignored.
 static u16 addr_crc(u16 addr) {
   static const u8 x[16] = { 0, 0, 0, 0, 0, 0x15, 0x1F, 0x0B, 0x16, 0x19, 0x07, 0x0E, 0x1C, 0x0D, 0x1A, 0x01 };
   addr &= 0xFFE0;
@@ -22,6 +25,7 @@ static u16 addr_crc(u16 addr) {
   return addr | (c & 0x1F);
 }
 
+// CRC-8, polynomial 0x85, over 32 data bytes. The last pass (i == 32) feeds eight zero bits.
 static u8 data_crc(const u8 *d) {
   u32 crc = 0;
   for (int i = 0; i <= 32; i++) {
@@ -51,12 +55,14 @@ bool k64_pak_write32(int port, u16 addr, const u8 in[32]) {
   return rx[0] == data_crc(in);
 }
 
+// Writes one 32-byte block filled with v (register probes use this).
 static bool fill_write(int port, u16 addr, u8 v) {
   u8 b[32];
   for (int i = 0; i < 32; i++) b[i] = v;
   return k64_pak_write32(port, addr, b);
 }
 
+// True when the block at addr reads back with v in its last byte.
 static bool reads_back(int port, u16 addr, u8 v) {
   u8 b[32];
   return k64_pak_read32(port, addr, b) && b[31] == v;
@@ -86,11 +92,13 @@ k64_pak_type_t k64_pak_probe(int port) {
   return K64_PAK_UNKNOWN;
 }
 
+// Rumble motor register at 0xC000: 1 = on, 0 = off.
 bool k64_rumble(int port, bool on) { return fill_write(port, ADDR_MOTOR, on ? 1 : 0); }
 
 bool k64_cpak_read(int port, u32 offset, void *dst, u32 len) {
   if (offset > K64_CPAK_SIZE || len > K64_CPAK_SIZE - offset) return false;
   u8 *d = dst, blk[32];
+  // Each 32-byte block is read whole; only the requested slice is copied out.
   while (len) {
     u32 base = offset & ~31u, o = offset - base, n = 32 - o < len ? 32 - o : len;
     if (!k64_pak_read32(port, (u16)base, blk)) return false;
@@ -112,6 +120,7 @@ bool k64_cpak_write(int port, u32 offset, const void *src, u32 len) {
       continue;
     }
     if (!k64_pak_read32(port, (u16)base, blk)) return false;
+    // Write back only when something changed: a pak write is slow and wears the pak.
     bool same = true;
     for (u32 i = 0; i < n; i++) { same = same && blk[o + i] == s[i]; blk[o + i] = s[i]; }
     if (!same && !k64_pak_write32(port, (u16)base, blk)) return false;

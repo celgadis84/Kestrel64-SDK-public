@@ -2,8 +2,8 @@
 // read-back check of unaligned writes across block edges. Built four times (EEPROM 16K, SRAM 256K, SRAM 768K, FlashRAM).
 #include <k64/k64.h>
 
-typedef struct { u32 magic, boots; } header_t;
-#define MAGIC 0x4B363453u   // "K64S"
+typedef struct { u32 signature, boots; } header_t;
+#define SIGNATURE 0x4B363453u   // "K64S"
 
 static const char *type_name(k64_save_type_t t) {
   static const char *n[] = { "none", "EEPROM 4K", "EEPROM 16K", "SRAM 256K", "SRAM 1M", "FlashRAM 1M", "SRAM 768K" };
@@ -21,7 +21,7 @@ int main(void) {
 
   header_t h = { 0, 0 };
   bool ok = t != K64_SAVE_NONE && k64_save_read(0, &h, sizeof h);
-  if (h.magic != MAGIC) h = (header_t){ MAGIC, 0 };
+  if (h.signature != SIGNATURE) h = (header_t){ SIGNATURE, 0 };
   h.boots++;
   u32 t0 = k64_count();
   ok = ok && k64_save_write(0, &h, sizeof h);
@@ -40,7 +40,7 @@ int main(void) {
   bool same = rd;
   for (u32 i = 0; same && i < sizeof pat; i++) same = pat[i] == back[i];
   header_t h2 = { 0, 0 };
-  bool hdr_ok = ok && k64_save_read(0, &h2, sizeof h2) && h2.magic == MAGIC && h2.boots == h.boots;
+  bool hdr_ok = ok && k64_save_read(0, &h2, sizeof h2) && h2.signature == SIGNATURE && h2.boots == h.boots;
   bool pass = ok && same && hdr_ok;
   bool oob = !k64_save_write(size - 4, pat, 8);                  // past the end: refused
   pass = pass && oob;

@@ -8,6 +8,8 @@
 #define MAGIC   0x4B363453u   // 'K64S'
 #define PACKED  0x80000000u
 
+// Sorted by hash of the path (without leading '/'). name is relative to dir, data to k64_romfs,
+// size is the stored length with bit 31 = packed.
 typedef struct { u32 hash, name, data, size; } entry_t;
 
 // The image, linked by k64_add_rom(... ROMFS ...): its address is the PI address.
@@ -17,10 +19,12 @@ static const u8 *dir;           // header + entries + names, in RAM
 static u32 count;
 static u64 bounce[64];          // 512 bytes: unaligned reads
 
+// Copies the directory into the heap on first use. Nothing is kept on failure, so a later call retries.
 static bool mount(void) {
   if (dir) return true;
   if (!k64_romfs) return false;
   u32 rom = (u32)k64_romfs;
+  // Header: magic, entry count, directory bytes (the fourth word is not used here).
   u32 hdr[4] K64_ALIGN(16);
   k64_pi_read(hdr, rom, 16);
   if (hdr[0] != MAGIC) return false;
@@ -33,9 +37,11 @@ static bool mount(void) {
 
 static const entry_t *entries(void) { return (const entry_t *)(dir + 16); }
 
+// Entry for path, or NULL. Binary search on the hash, then exact compare over the equal-hash run.
 static const entry_t *find(const char *path) {
   if (!mount()) return NULL;
   while (*path == '/') path++;
+  // FNV-1a, 32 bit: offset basis 0x811C9DC5, prime 0x01000193. Must match the build tool's hash.
   u32 h = 0x811C9DC5u;
   for (const u8 *p = (const u8 *)path; *p; p++) h = (h ^ *p) * 0x01000193u;
   const entry_t *e = entries();
@@ -62,10 +68,12 @@ u32 k64_romfs_read(k64_file_t *f, void *dst, u32 len) {
   u8 *d = dst;
   for (u32 left = len; left;) {
     u32 rom = f->rom + f->pos, n;
+    // Direct PI DMA: RAM 8-byte aligned, ROM address even, length even (rounded down).
     if (((u32)d & 7) == 0 && (rom & 1) == 0 && left >= 2) {
       n = left & ~1u;                                   // PI DMA lengths are even
       k64_pi_read(d, rom, n);
     } else {
+      // Odd ROM address: DMA from the even address below and copy from the odd byte.
       u32 skew = rom & 1;
       n = left < sizeof bounce - 2 ? left : sizeof bounce - 2;
       k64_pi_read(bounce, rom - skew, (skew + n + 1) & ~1u);   // the file data is padded to 16
@@ -85,6 +93,7 @@ void *k64_romfs_load(const char *path, u32 *size) {
   k64_file_t f;
   if (!k64_romfs_open(&f, path)) return NULL;
   if (f.packed) return k64_unpack_rom_alloc(f.rom, size);
+  // The PI read below rounds its length up to even; the 16-byte rounding always leaves room for it.
   void *p = k64_mem_alloc(K64_ZONE_HEAP, (f.size + 15) & ~15u, 16);
   if (f.size) k64_pi_read(p, f.rom, (f.size + 1) & ~1u);
   if (size) *size = f.size;

@@ -17,6 +17,7 @@ void k64_runtime_init(void) {
   for (u32 i = 0; i < K64_ARRAY_LEN(vec); i++) {
     u32 *dst = (u32*)vec[i]; const u32 *src = (const u32*)k64_vector_stub;
     for (u32 w = 0; w < n / 4; w++) dst[w] = src[w];
+    // The stub was written through the D$: write it back so the I$ refill reads it from RDRAM.
     k64_dcache_writeback((void*)vec[i], n);
     k64_icache_invalidate((void*)vec[i], n);
   }
@@ -25,6 +26,7 @@ void k64_runtime_init(void) {
   // Tell the PIF boot is over (bit 3 of the PIF RAM control byte). Without it the PIF
   // halts the CPU ~5 s after power-on; libultra does the same in osInitialize.
   while (SI_STATUS & (SI_ST_DMA_BUSY | SI_ST_IO_BUSY)) {}
+  // PIF RAM is reached through SI: wait for it to be idle around each access.
   u32 ctl = K64_REG(K64_KSEG1(PIF_RAM_PHYS + 0x3C));
   while (SI_STATUS & (SI_ST_DMA_BUSY | SI_ST_IO_BUSY)) {}
   K64_REG(K64_KSEG1(PIF_RAM_PHYS + 0x3C)) = ctl | 0x08;

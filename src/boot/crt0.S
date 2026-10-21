@@ -100,6 +100,8 @@ _start:
     .section .text.vec, "ax", @progbits
     .global k64_vector_stub
     .global k64_vector_stub_end
+# Each vector slot is 0x80 bytes and branches cannot reach the handler, so the stub loads its
+# full address into k0 (the register the ABI leaves to exception code) and jumps.
 k64_vector_stub:
     lui     $k0, %hi(k64_exception_entry)
     addiu   $k0, $k0, %lo(k64_exception_entry)
@@ -121,6 +123,8 @@ k64_exception_entry:
     addiu   $k0, $k0, -(8 << 2)
     beqz    $k0, k64_thread_sys # 8: syscall
     nop
+    # k64_exc_frame_t layout: gpr[n] at n * 8 (zero, k0, k1 skipped), then hi, lo, EPC, Status,
+    # Cause, BadVAddr, FCSR. t0 is reused as scratch only after its own value is stored.
     lui     $k0, %hi(k64_exc_frame)
     addiu   $k0, $k0, %lo(k64_exc_frame)
     sd      $1,   8($k0)
@@ -170,6 +174,7 @@ k64_exception_entry:
     lui     $t0, 0x2400
     mtc0    $t0, $12
     nop
+    # Own stack: the faulting sp may be the cause of the fault.
     lui     $sp, %hi(k64_crash_stack + 4096)
     addiu   $sp, $sp, %lo(k64_crash_stack + 4096)
     jal     k64_crash
@@ -250,6 +255,8 @@ k64_vi_isr:
 k64_thread_exc:
     lui     $k0, %hi(k64_thread_cur)
     lw      $k0, %lo(k64_thread_cur)($k0)
+    # k64_thread_ctx_t: gpr[n] at n * 8, hi 256, lo 264, epc 272, sr 276, fcsr 280,
+    # partial 284, fpr[n] at 288 + n * 8.
     sd      $1, 8($k0)
     sd      $2, 16($k0)
     sd      $3, 24($k0)
@@ -356,11 +363,12 @@ k64_thread_sys:
     sw      $t0, 276($k0)
     cfc1    $t0, $31            # FCSR
     sw      $t0, 280($k0)
+    # Kernel stack (k64_thread_kstack, 256 dwords): dispatch never runs on a thread's stack.
     lui     $sp, %hi(k64_thread_kstack + 2048)
     addiu   $sp, $sp, %lo(k64_thread_kstack + 2048)
     jal     k64_thread_dispatch
     mfc0    $a0, $13            # Cause
-    move    $k0, $v0
+    move    $k0, $v0                # the thread to resume
 
     lw      $t0, 280($k0)
     ctc1    $t0, $31
@@ -369,13 +377,13 @@ k64_thread_sys:
     lw      $t0, 276($k0)
     lui     $t1, %hi(k64_thread_im)
     lw      $t1, %lo(k64_thread_im)($t1)
-    lui     $t2, 0xFFFF
+    lui     $t2, 0xFFFF             # saved Status with its IM field (bits 15..8) replaced
     ori     $t2, $t2, 0x00FF
     and     $t0, $t0, $t2
     or      $t0, $t0, $t1
     ori     $t0, $t0, 2         # keep EXL until eret
     mtc0    $t0, $12
-    lw      $t0, 284($k0)
+    lw      $t0, 284($k0)           # partial (syscall) context: callee-saved registers only
     beqz    $t0, 3f
     nop
     ldc1    $f20, 448($k0)
@@ -405,7 +413,7 @@ k64_thread_sys:
     nop
     eret
 
-3:
+3:  # full context (interrupt, or a thread's first run); t0 last via $8 below
     ldc1    $f0, 288($k0)
     ldc1    $f1, 296($k0)
     ldc1    $f2, 304($k0)

@@ -10,6 +10,7 @@ static s16 *bufs[AUDIO_BUFS];
 static u32 nframes, out_rate, next_buf;
 static bool filling;
 
+// The AI sample rate is this TV standard's VI clock divided by an integer (k64_audio_init).
 static u32 vi_clock(void) {
   switch (k64_tv_type()) {
   case K64_TV_PAL:  return 49656530;
@@ -24,6 +25,7 @@ void k64_audio_init(u32 rate, u32 frames) {
   u32 dac = (2 * clock / rate + 1) / 2;        // rounded divider
   u32 bits = dac / 66;
   if (bits > 16) bits = 16;
+  // the registers hold the divider minus one
   AI_DACRATE = dac - 1;
   AI_BITRATE = bits - 1;
   AI_CONTROL = 1;                              // DMA enable
@@ -34,7 +36,9 @@ void k64_audio_init(u32 rate, u32 frames) {
     if (frames > cap)                          // AI DMA reads them: any bank will do, so a full heap spills to fb
       bufs[i] = k64_mem_alloc(k64_mem_largest_free(K64_ZONE_HEAP) >= frames * 4 + 16 ? K64_ZONE_HEAP : K64_ZONE_FB,
                               frames * 4, 16);
+    // silence: a buffer queued before the game fills it plays as quiet
     for (u32 k = 0; k < frames * 2; k++) bufs[i][k] = 0;
+    // the AI DMA reads RDRAM, not the cache
     k64_dcache_writeback(bufs[i], frames * 4);
   }
   if (frames > cap) cap = frames;
@@ -46,7 +50,9 @@ u32 k64_audio_rate(void)   { return out_rate; }
 u32 k64_audio_frames(void) { return nframes; }
 
 s16 *k64_audio_next(void) {
+  // the buffer handed out stays the same until it is submitted
   if (filling) return bufs[next_buf];
+  // AI queue full (both entries taken): no buffer this frame
   if (AI_STATUS & AI_ST_FULL) return NULL;
   filling = true;
   return bufs[next_buf];
@@ -54,7 +60,7 @@ s16 *k64_audio_next(void) {
 
 void k64_audio_submit(s16 *buf) {
   K64_ASSERT(filling && buf == bufs[next_buf]);
-  while (AI_STATUS & AI_ST_FULL) {}
+  while (AI_STATUS & AI_ST_FULL) {}              // poll for a free queue entry
   AI_DRAM_ADDR = K64_PHYS(buf);
   AI_LEN = nframes * 4;
   AI_STATUS = 0;                               // acknowledge the AI interrupt (masked anyway)

@@ -7,16 +7,19 @@
 #define FONT_TILE 2
 #define BATCH     128            // glyphs laid out before a flush
 
+// One queued glyph: pen position in pixels, glyph index, palette slot and sheet.
 typedef struct { s16 x, y; u16 g; u8 color, sheet; } item_t;
 
+// Queued glyphs, the sheets they use (bit mask), the palette, and the shadow offset and colour.
 static item_t batch[BATCH];
 static u32 nbatch, sheet_mask;
 static u32 palette[8];
 static int shadow_dx, shadow_dy;
 static u32 shadow_rgba;
 
+// 'K6F1' blob: this header, then the codepoint, glyph, kern and sheet tables at the offsets below.
 typedef struct {
-  char magic[4];
+  char fourcc[4];
   u8 flags, nsheets;
   u16 nglyphs, line_height, ascent, nkern, fallback;
   u32 off_cp, off_glyph, off_kern, off_sheet;
@@ -25,7 +28,7 @@ typedef struct {
 bool k64_font_from_blob(k64_font_t *f, const void *blob) {
   const blob_hdr_t *h = blob;
   const u8 *b = blob;
-  if (__builtin_memcmp(h->magic, "K6F1", 4) || h->nsheets > K64_FONT_MAX_SHEETS) return false;
+  if (__builtin_memcmp(h->fourcc, "K6F1", 4) || h->nsheets > K64_FONT_MAX_SHEETS) return false;
   f->codepoints = (const u16 *)(b + h->off_cp);
   f->glyphs = (const k64_glyph_t *)(b + h->off_glyph);
   f->kern = (const u32 *)(b + h->off_kern);
@@ -34,9 +37,11 @@ bool k64_font_from_blob(k64_font_t *f, const void *blob) {
   f->line_height = h->line_height; f->ascent = h->ascent; f->fallback = h->fallback;
   f->nsheets = h->nsheets;
   f->mono = h->flags & 1;
+  // ASCII fast path when glyphs 0..94 are U+0020..U+007E in order: glyph = cp - 32.
   f->ascii = h->nglyphs >= 95;
   for (u32 i = 0; i < 95 && f->ascii; i++) f->ascii = f->codepoints[i] == 32 + i;
   for (u32 i = 0; i < h->nsheets; i++) {
+    // Sheet entry: w, h, pixel offset. I4 rows are w/2 bytes; tmem_line is the row in 8-byte words.
     const u8 *s = b + h->off_sheet + 8 * i;
     u16 w = (u16)(s[0] << 8 | s[1]), ht = (u16)(s[2] << 8 | s[3]);
     u32 off = (u32)s[4] << 24 | (u32)s[5] << 16 | (u32)s[6] << 8 | s[7];
@@ -46,6 +51,7 @@ bool k64_font_from_blob(k64_font_t *f, const void *blob) {
   return true;
 }
 
+// Glyph index for a codepoint: direct for ASCII fonts, else binary search; unknown maps to fallback.
 u32 k64_font_glyph(const k64_font_t *f, u32 cp) {
   if (f->ascii && cp - 32 < 95) return cp - 32;
   u32 lo = 0, hi = f->nglyphs;
@@ -56,6 +62,8 @@ u32 k64_font_glyph(const k64_font_t *f, u32 cp) {
   return lo < f->nglyphs && f->codepoints[lo] == cp ? lo : f->fallback;
 }
 
+// Kerning adjust (signed, quarter pixels) for the pair a, b. kern_first[a]..kern_first[a+1] bounds the
+// entries for a; each entry holds the key a << 12 | b in bits 8..31 and the adjust in the low byte.
 static int kern(const k64_font_t *f, u32 a, u32 b) {
   u32 key = a << 12 | b, lo = f->kern_first[a], hi = f->kern_first[a + 1];
   while (lo < hi) {
@@ -82,6 +90,8 @@ static u32 utf8(const u8 **ps, const u8 *e) {
   return c;
 }
 
+// Text render mode: mono fonts alpha-compare and blend; the others force a blend that reads the
+// framebuffer.
 static void set_modes(const k64_font_t *f) {
   u64 om = K64_OM_BASE | K64_OM_CYCLE_1 | K64_OM_ALPHA_COMPARE;
   if (f->mono) {
@@ -95,13 +105,18 @@ static void set_modes(const k64_font_t *f) {
     k64_rdp_set_blend_color(0x00000001);
   }
   k64_rdp_set_other_modes(om);
+  // RGB is the primitive colour; alpha is the texel alpha times the primitive alpha (coverage).
   k64_rdp_set_combine(K64_CC_1CYC(CC_ZERO,CC_ZERO,CC_C_ZERO,CC_PRIM, CA_TEX0,CA_ZERO,CA_PRIM,CA_ZERO));
 }
 
+// Draws the queued glyphs and empties the batch: one texture load per sheet, shadow pass first.
 static void flush(const k64_font_t *f) {
+  // Sheets in ascending order, each loaded once per flush.
   for (u32 sh = 0; sheet_mask >> sh; sh++) {
     if (!(sheet_mask >> sh & 1)) continue;
     k64_rdp_load_tex(FONT_TILE, 0, &f->sheets[sh], K64_TEX_CLAMP, K64_TEX_CLAMP);
+    // Pass 0 is the shadow (offset by shadow_dx/dy, drawn first); pass 1 the glyphs. A zero shadow
+    // alpha skips pass 0.
     for (int pass = shadow_rgba & 0xFF ? 0 : 1; pass < 2; pass++) {
       int dx = pass ? 0 : shadow_dx, dy = pass ? 0 : shadow_dy;
       if (!pass) k64_rdp_set_prim_color(shadow_rgba);
@@ -127,12 +142,15 @@ static int run(const k64_font_t *f, int x, int y, const u8 *s, const u8 *e, u8 *
   while (s < e) {
     u32 cp = utf8(&s, e);
     if (cp == '\n') { y += f->line_height; pen = 0; x = x0; prev = 0xFFFF; continue; }
+    // Control codes 1..8 select palette slot 0..7 (slot 0 is the draw colour) and draw nothing.
     if (cp - 1 < 8) { *color = (u8)(cp - 1); continue; }
     u32 gi = k64_font_glyph(f, cp);
     const k64_glyph_t *g = &f->glyphs[gi];
+    // Pen is in quarter pixels; kerning applies between this glyph and the previous one.
     if (prev != 0xFFFF && f->nkern) pen += kern(f, prev, gi);
     prev = gi;
     if (draw && g->w) {
+      // Batch full: draw what is queued before adding this glyph.
       if (nbatch == BATCH) flush(f);
       batch[nbatch++] = (item_t){(s16)(x + ((pen + 2) >> 2) + g->xoff), (s16)(y + g->yoff), (u16)gi, *color, g->sheet};
       sheet_mask |= 1u << g->sheet;
@@ -142,6 +160,7 @@ static int run(const k64_font_t *f, int x, int y, const u8 *s, const u8 *e, u8 *
   return x + ((pen + 2) >> 2);
 }
 
+// Slots 1..7 are settable; slot 0 is the colour passed to each draw call.
 void k64_font_set_palette(u32 index, u32 rgba) {
   if (index - 1 < 7) palette[index] = rgba;
 }
@@ -191,11 +210,14 @@ int k64_font_box(const k64_font_t *f, int x, int y, int w, u32 align, u32 rgba, 
       if (q == e || *q == '\n') { end = q; next = q == e ? q : q + 1; width = pen; break; }
       const u8 *c0 = q;
       u32 cp = utf8(&q, e);
+      // Colour codes take no width.
       if (cp - 1 < 8) continue;
       if (cp == ' ') { brk = c0; brk_pen = pen; }
       u32 gi = k64_font_glyph(f, cp);
       int adv = (prev != 0xFFFF && f->nkern ? kern(f, prev, gi) : 0) + f->glyphs[gi].advance;
       prev = gi;
+      // Overflow: break at the last space if there is one, else inside the word. The first glyph of
+      // a line never breaks.
       if (cp != ' ' && pen + adv > w * 4 && c0 != p) {
         if (brk) { end = brk; next = brk + 1; width = brk_pen; }
         else     { end = c0;  next = c0;      width = pen; }

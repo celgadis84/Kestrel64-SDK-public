@@ -37,6 +37,8 @@ static bool yield_req;
 static u32 switches;
 
 // ---- queues: sorted by priority, FIFO among equals ----------------------------------------
+// Inserts t after every thread of equal or higher priority (so equals stay FIFO) and records
+// which list holds it, for q_remove.
 static void q_insert(k64_thread_t **head, k64_thread_t *t) {
   k64_thread_t **p = head;
   while (*p && (*p)->pri >= t->pri) p = &(*p)->next;
@@ -45,6 +47,7 @@ static void q_insert(k64_thread_t **head, k64_thread_t *t) {
   t->queue = head;
 }
 
+// Unlinks t from whatever list holds it; no-op if it is on none (running or stopped).
 static void q_remove(k64_thread_t *t) {
   if (!t->queue) return;
   for (k64_thread_t **p = t->queue; *p; p = &(*p)->next)
@@ -53,6 +56,7 @@ static void q_remove(k64_thread_t *t) {
   t->queue = NULL;
 }
 
+// Takes the head (highest priority) off a non-empty list.
 static k64_thread_t *q_pop(k64_thread_t **head) {
   k64_thread_t *t = *head;
   *head = t->next;
@@ -71,6 +75,8 @@ static void resched(void) {
   if (runq && runq->pri > k64_thread_cur->pri) k64_thread_syscall();
 }
 
+// Thread side, interrupts off: parks the current thread on a wait list and switches away.
+// Returns once someone moved it back to the run queue; callers re-check their condition.
 static void block_on(k64_thread_t **list) {
   k64_thread_cur->state = K64_THREAD_WAITING;
   q_insert(list, k64_thread_cur);
@@ -84,7 +90,7 @@ void k64_mq_init(k64_mq_t *q, k64_msg_t *msgs, u32 count) {
 
 // Puts a message and wakes the first receiver. Interrupts off; caller has checked room.
 static void mq_put(k64_mq_t *q, k64_msg_t m, bool jam) {
-  if (jam) {
+  if (jam) {                              // jam: in front of the oldest message
     q->first = (q->first ? q->first : q->count) - 1;
     q->msgs[q->first] = m;
   } else {
@@ -95,6 +101,8 @@ static void mq_put(k64_mq_t *q, k64_msg_t m, bool jam) {
   if (q->recv_wait) make_ready(q_pop(&q->recv_wait));
 }
 
+// Send/jam body: waits for room when blocking (re-checked on every wake, another sender may
+// have taken it), then hands the message over and switches if that woke a higher priority.
 static bool mq_send(k64_mq_t *q, k64_msg_t m, bool block, bool jam) {
   u32 ie = k64_irq_disable();
   while (q->valid >= q->count) {
@@ -126,23 +134,27 @@ bool k64_mq_recv(k64_mq_t *q, k64_msg_t *m, bool block) {
 }
 
 // ---- threads ----------------------------------------------------------------------------------
+// First code of every created thread (its EPC): a thread whose function returns stops itself.
 static void thread_entry(void (*fn)(void *), void *arg) {
   fn(arg);
   k64_thread_stop(NULL);
 }
 
+// Priority -1, always ready, so the run queue is never empty when everything else waits.
 static void idle_fn(void *arg) { (void)arg; for (;;) {} }
 
+// Context registers are 64 bits: a 32-bit KSEG0 address must be sign-extended, or a 64-bit
+// restore would load a non-canonical address.
 #define SEXT(p) ((u64)(s64)(s32)(u32)(p))
 
 void k64_thread_create(k64_thread_t *t, u32 id, void (*fn)(void *), void *arg, void *stack_top, s32 pri) {
   *t = (k64_thread_t){ .pri = pri, .id = id, .state = K64_THREAD_STOPPED };
   u32 gp;
   __asm__("move %0, $gp" : "=r"(gp));
-  t->ctx.gpr[4] = SEXT(fn);
+  t->ctx.gpr[4] = SEXT(fn);                        // a0, a1: thread_entry's arguments
   t->ctx.gpr[5] = SEXT(arg);
   t->ctx.gpr[28] = SEXT(gp);
-  t->ctx.gpr[29] = SEXT((u32)stack_top - 16);
+  t->ctx.gpr[29] = SEXT((u32)stack_top - 16);     // sp, 16 bytes of argument home space
   t->ctx.epc = (u32)thread_entry;
   t->ctx.sr = SR_BASE | SR_EXL | SR_IE;            // partial = 0: full restore
   u32 fcsr;
@@ -202,6 +214,7 @@ void k64_thread_yield(void) {
 u32 k64_thread_switches(void) { return switches; }
 
 // ---- events -----------------------------------------------------------------------------------
+// Applies k64_thread_im to the live Status register (the IM field, bits 15..8).
 static void status_im(void) {
   k64_set_status((k64_status() & ~0xFF00u) | k64_thread_im);
 }
@@ -231,11 +244,15 @@ void k64_counter_set(u32 count) {
   k64_irq_restore(ie);
 }
 
+// Interrupt side: delivers an event's message, dropped silently when its queue is full
+// (libultra behaviour: an event is a notification, not a counted resource).
 static void post(k64_event_t e) {
   k64_mq_t *q = events[e].q;
   if (q && q->valid < q->count) mq_put(q, events[e].m, false);
 }
 
+// Interrupt side: acknowledges every pending, enabled source at its device (each one keeps
+// its line asserted until acked) and posts its event.
 static void handle_irq(u32 cause) {
   u32 ip = cause & k64_thread_im;
   if (ip & SR_IM_RCP) {
@@ -245,7 +262,7 @@ static void handle_irq(u32 cause) {
     if (pend & MI_INTR_AI) { AI_STATUS = 0;              post(K64_EVENT_AI); }
     if (pend & MI_INTR_VI) {
       if (k64_vi_interlaced) k64_vi_field_irq();
-      VI_V_CURRENT = 0;
+      VI_V_CURRENT = 0;                   // any write acks the VI interrupt
       post(K64_EVENT_VI);
     }
     if (pend & MI_INTR_PI) { PI_STATUS = PI_WR_CLR_INTR; post(K64_EVENT_PI); }

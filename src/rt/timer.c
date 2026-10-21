@@ -2,6 +2,7 @@
 #include <k64/timer.h>
 #include <k64/cpu.h>
 
+// Count at the last k64_time(). A smaller value now means Count wrapped (about every 92 s).
 static u32 last_count;
 static u64 high;                  // wraps of Count seen so far, << 32
 
@@ -17,8 +18,10 @@ u64 k64_time(void) {
   return t;
 }
 
+// Armed timers sorted by deadline; the head fires first.
 static k64_timer_t *pending;
 
+// Removes t from the pending list if it is there, and clears its link state.
 static void unlink(k64_timer_t *t) {
   for (k64_timer_t **p = &pending; *p; p = &(*p)->next)
     if (*p == t) { *p = t->next; break; }
@@ -26,6 +29,7 @@ static void unlink(k64_timer_t *t) {
   t->active = false;
 }
 
+// Sorted insert by deadline.
 static void insert(k64_timer_t *t) {
   k64_timer_t **p = &pending;
   while (*p && (*p)->deadline <= t->deadline) p = &(*p)->next;   // FIFO among equal deadlines

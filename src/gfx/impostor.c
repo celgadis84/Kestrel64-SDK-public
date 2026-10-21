@@ -3,6 +3,7 @@
 #include <k64/mem.h>
 #include <k64/cpu.h>
 
+// One view: its TMEM load (recorded once) and the direction it was taken from.
 struct k64_impostor_view_s {
   u64 cmds[K64_TEX_LOAD_CMDS];             // TMEM load of this view (k64_tex_load_cmds)
   u32 ncmds;
@@ -11,10 +12,13 @@ struct k64_impostor_view_s {
 };
 
 static u32 rd32(const u8 *p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
+// Big-endian float from the blob (the u32 bit pattern).
 static float rdf(const u8 *p) { union { u32 u; float f; } x = { rd32(p) }; return x.f; }
 
 bool k64_impostor_init(k64_impostor_t *im, const void *blob, u32 tile, u32 tmem) {
   const u8 *b = blob;
+  // Header: 'K6I1', u16 view count at 4, u32 cell stride at 8, floats half_w/height/y0/cx/cz at 12..28,
+  // cells from 32.
   u32 views = (u32)((b[4] << 8) | b[5]), stride = rd32(b + 8);
   if (rd32(b) != 0x4B364931 || !views || views > K64_IMPOSTOR_MAX_VIEWS) return false;   // 'K6I1'
   im->views = views;
@@ -26,7 +30,9 @@ bool k64_impostor_init(k64_impostor_t *im, const void *blob, u32 tile, u32 tmem)
   for (u32 k = 0; k < views; k++) {
     struct k64_impostor_view_s *v = &im->v[k];
     if (!k64_tex_from_blob(&v->tex, im->cells + k * stride)) return false;
+    // Recorded once: k64_impostor_load replays this TMEM load for the view.
     v->ncmds = k64_tex_load_cmds(v->cmds, tile, tmem, &v->tex, K64_TEX_CLAMP, K64_TEX_CLAMP);
+    // Views are spaced evenly around the axis; (dx, dz) is the direction the view was taken from.
     float phi = (2 * K64_PI / views) * k;
     v->dx = k64_sinf(phi); v->dz = k64_cosf(phi);
   }
@@ -65,6 +71,8 @@ u32 k64_impostor_view(const k64_impostor_t *im, const k64_impostor_inst_t *in, k
 
 const k64_tex_t *k64_impostor_tex(const k64_impostor_t *im, u32 view) { return &im->v[view].tex; }
 
+// Quad for one instance and view: the full cell as the texture rect (s10.5), half-width and height
+// scaled by the instance.
 static void quad(const k64_impostor_t *im, k64_vtx_t v[4], const k64_impostor_inst_t *in, u32 view,
                  k64_vec3_t base, k64_vec3_t eye, u32 rgba) {
   const k64_tex_t *t = &im->v[view].tex;
@@ -86,6 +94,7 @@ void k64_impostor_load(k64_kgfx_list_t *l, const k64_impostor_t *im, u32 view) {
 
 u32 k64_impostor_draw(k64_kgfx_list_t *l, const k64_impostor_t *im, const k64_impostor_inst_t *in, u32 n,
                       k64_vec3_t eye, u32 rgba, k64_vtx_t *vbuf) {
+  // Quads are bucketed by view with a counting sort: count[k + 1] tallies view k.
   u16 count[K64_IMPOSTOR_MAX_VIEWS + 1] = { 0 };
   u8 view[256];
   u32 loads = 0;
@@ -109,6 +118,7 @@ u32 k64_impostor_draw(k64_kgfx_list_t *l, const k64_impostor_t *im, const k64_im
     u16 fill[K64_IMPOSTOR_MAX_VIEWS];
     for (u32 k = 0; k < im->views; k++) fill[k] = count[k];
     for (u32 i = 0; i < m; i++) view[i] = (u8)fill[view[i]]++;       // view[i] = slot of quad i
+    // Permute in place: follow each cycle of the slot permutation, swapping quads into their slots.
     for (u32 i = 0; i < m; i++)
       while (view[i] != i) {                                         // follow the cycle
         u32 j = view[i];
@@ -116,12 +126,14 @@ u32 k64_impostor_draw(k64_kgfx_list_t *l, const k64_impostor_t *im, const k64_im
         for (int k = 0; k < 4; k++) { t[k] = vb[j * 4 + k]; vb[j * 4 + k] = vb[i * 4 + k]; vb[i * 4 + k] = t[k]; }
         view[i] = view[j]; view[j] = (u8)j;
       }
+    // The RSP reads the quads from RDRAM.
     k64_dcache_writeback(vb, m * 4 * sizeof *vb);
     for (u32 k = 0; k < im->views; k++) {
       u32 q0 = count[k], q1 = count[k + 1];
       if (q0 == q1) continue;
       k64_impostor_load(l, im, k);
       loads++;
+      // Quads go to the vertex cache in batches of VCACHE/4 (4 vertices per quad).
       for (u32 q = q0; q < q1; q += K64_KGFX_VCACHE / 4) {
         u32 nq = q1 - q > K64_KGFX_VCACHE / 4 ? K64_KGFX_VCACHE / 4 : q1 - q;
         k64_kgfx_vtx(l, vb + q * 4, nq * 4, 0);

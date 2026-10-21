@@ -13,16 +13,16 @@ static const u32 vi_timing[3][7] = {
   [K64_TV_MPAL] = { 0x04651e39, 0x0000020d, 0x00040c11, 0x0c190c1a, 0x006c02ec, 0x002501ff, 0x000e0204 },
 };
 
-#define VI_TYPE_16       2u
+#define VI_TYPE_16       2u          // VI_CTRL bits 0-1: pixel type
 #define VI_TYPE_32       3u
 #define VI_GAMMA_DITHER  (1u << 2)
-#define VI_DIVOT         (1u << 4)
-#define VI_SERRATE       (1u << 6)
+#define VI_DIVOT         (1u << 4)   // divot filter (AA on)
+#define VI_SERRATE       (1u << 6)   // serrate: interlaced output
 #define SR_IM_RCP        0x0400u    // IP2: RCP (MI) interrupt line
 #define VI_AA_FULL       (0u << 8)   // AA + resample, always fetch extra line
 #define VI_AA_RESAMPLE   (2u << 8)   // resample only
-#define VI_DEDITHER      (1u << 16)
-#define VI_PIXEL_ADV     (3u << 12)
+#define VI_DEDITHER      (1u << 16)  // dedither filter
+#define VI_PIXEL_ADV     (3u << 12)  // pixel advance field; 3 is the usual value
 
 // Per field (V_CURRENT bit 0 at the vblank interrupt): VI_ORIGIN, VI_V_BURST. Read by
 // crt0.S, layout fixed: [field * 2 + 0] = origin, [field * 2 + 1] = v_burst.
@@ -40,6 +40,7 @@ static u8  nbuf, front;
 static u32 frames;
 static u32 vi_ctrl;
 
+// Boot-time TV type (the IPL writes it at 0x80000300); unknown values fall back to NTSC.
 k64_tv_t k64_tv_type(void) {
   u32 t = K64_BOOT_TVTYPE;
   return t <= 2 ? (k64_tv_t)t : K64_TV_NTSC;
@@ -63,6 +64,7 @@ void k64_vi_field_irq(void) {
   VI_V_BURST = k64_vi_field[f * 2 + 1];
 }
 
+// Interlaced: field 0 starts one line down (odd lines), field 1 at the top, so they interleave.
 static void set_field_origins(u32 phys, u32 stride) {
   k64_vi_field[0] = phys + stride;
   k64_vi_field[2] = phys;
@@ -97,7 +99,9 @@ void k64_display_init(const k64_display_cfg_t *cfg) {
 
   k64_tv_t tv = k64_tv_type();
   const u32 *t = vi_timing[tv];
+  // Interrupts off: the VI handler must not see the origins or timing half written.
   u32 ie = k64_irq_disable();
+  // Leaving interlace: the VI interrupt (MI bit 3) only serves the per-field origin swap.
   if (k64_vi_interlaced && !ilace) MI_MASK = MI_MASK_CLR(3);
   k64_vi_interlaced = ilace;
   VI_CTRL = 0;                                  // blank while reprogramming
@@ -112,7 +116,9 @@ void k64_display_init(const k64_display_cfg_t *cfg) {
   VI_CTRL = vi_ctrl;
   if (ilace) {
     set_field_origins(K64_PHYS(surf[0].pixels), stride);
+    // V_BURST per field: only MPAL alternates it (see mpal_vburst), the others keep the table value.
     for (int f = 0; f < 2; f++) k64_vi_field[f * 2 + 1] = tv == K64_TV_MPAL ? mpal_vburst[f] : t[6];
+    // The VI interrupt fires every field and swaps the origin (k64_vi_field_irq).
     MI_MASK = MI_MASK_SET(3);
     k64_set_status(k64_status() | SR_IM_RCP);   // IE comes back with the restore below
     ie = 1;
@@ -141,6 +147,8 @@ void k64_display_show(const k64_surface_t *s) {
     k64_vi_wait_vblank();
   } else {
     u32 field = k64_tv_type() == K64_TV_PAL ? K64_COUNT_HZ / 50 : K64_COUNT_HZ / 59;
+    // Same field as the last show (V_CURRENT did not go back down, less than a field of Count since):
+    // a second swap in one field would be unsafe, so wait for the next field start.
     if ((VI_V_CURRENT & ~1u) >= show_line && k64_count() - show_count < field)
       k64_vi_wait_vblank();
     else
@@ -155,7 +163,7 @@ void k64_display_show(const k64_surface_t *s) {
     VI_ORIGIN = k64_vi_field[(VI_V_CURRENT & 1) * 2];
     k64_irq_restore(ie);
   } else {
-    if (scanning) {
+    if (scanning) {                   // leave the k64_display_scan window: own scaler setup back
       VI_WIDTH = own_width;
       VI_X_SCALE = (own_width * 1024u) / 640u;
       VI_Y_SCALE = (own_height * 1024u) / 240u;

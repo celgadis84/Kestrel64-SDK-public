@@ -37,7 +37,7 @@ K64_INLINE bool k64_tex_split(const k64_tex_t *t) { return t->siz == K64_SIZ_32 
 // 1.402, -87/256 = -0.340, -183/256 = -0.715, 453/256 = 1.770. K4/K5 (combiner inputs) are 0.
 #define K64_YUV_CONVERT 179, -44, -92, 226, 0, 0
 
-// Parse a resident .k64t blob ('K6T1' header). Returns false on bad magic.
+// Parse a resident .k64t blob ('K6T1' header). Returns false on a bad header.
 bool k64_tex_from_blob(k64_tex_t *t, const void *blob);
 u32  k64_tex_tmem_bytes(const k64_tex_t *t);
 
