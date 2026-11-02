@@ -28,7 +28,7 @@ def measure(a, rom):
     env = dict(os.environ, KESTREL_AUDIO='0')
     exe = EXE
     if a.prdp:
-        exe, env['KESTREL_PRDP'] = EXE_PRDP, '1'
+        exe, env['KESTREL_GPURDP'] = EXE_PRDP, '1'
     if a.timing:
         env['KESTREL_RSP_TIMING'] = '1'
     proc = subprocess.Popen([exe, rom, '--port', str(a.port)], env=env,
